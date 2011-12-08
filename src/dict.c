@@ -41,11 +41,16 @@
 #include <stdarg.h>
 #include <assert.h>
 #include <limits.h>
+#ifndef _WIN32
 #include <sys/time.h>
+#endif
 #include <ctype.h>
 
 #include "dict.h"
 #include "zmalloc.h"
+#ifdef _WIN32
+#include "win32fixes.h"
+#endif
 
 /* Using dictEnableResize() / dictDisableResize() we make possible to
  * enable/disable resizing of the hash table as needed. This is very important

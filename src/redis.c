@@ -38,22 +38,33 @@
 
 #include <time.h>
 #include <signal.h>
+#ifndef _WIN32
 #include <sys/wait.h>
+#endif
 #include <errno.h>
 #include <assert.h>
 #include <ctype.h>
 #include <stdarg.h>
+#ifndef _WIN32
 #include <arpa/inet.h>
+#endif
 #include <sys/stat.h>
 #include <fcntl.h>
+#ifndef _WIN32
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/uio.h>
+#endif
 #include <limits.h>
 #include <float.h>
 #include <math.h>
 #include <pthread.h>
-#include <sys/resource.h>
+#ifdef _WIN32
+#include <locale.h>
+#endif
+#ifdef LIBUV
+#include "../deps/libuv/include/uv.h"
+#endif
 
 /* Our shared "common" objects */
 
@@ -198,7 +209,9 @@ struct redisCommand readonlyCommandTable[] = {
 /*============================ Utility functions ============================ */
 
 void redisLog(int level, const char *fmt, ...) {
+#ifndef _WIN32
     const int syslogLevelMap[] = { LOG_DEBUG, LOG_INFO, LOG_NOTICE, LOG_WARNING };
+#endif
     const char *c = ".-*#";
     time_t now = time(NULL);
     va_list ap;
@@ -221,7 +234,9 @@ void redisLog(int level, const char *fmt, ...) {
 
     if (server.logfile) fclose(fp);
 
+#ifndef _WIN32
     if (server.syslog_enabled) syslog(syslogLevelMap[level], "%s", msg);
+#endif
 }
 
 /* Redis generally does not try to recover from out of memory conditions
@@ -520,11 +535,8 @@ void updateLRUClock(void) {
                                                 REDIS_LRU_CLOCK_MAX;
 }
 
-int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+int serverCron() {
     int j, loops = server.cronloops;
-    REDIS_NOTUSED(eventLoop);
-    REDIS_NOTUSED(id);
-    REDIS_NOTUSED(clientData);
 
     /* We take a cached value of the unix time in the global state because
      * with virtual memory and aging there is to store the current time
@@ -583,10 +595,17 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 
     /* Show information about connected clients */
     if (!(loops % 50)) {
+#ifdef _WIN32
+        redisLog(REDIS_VERBOSE,"%d clients connected (%d slaves), %llu bytes in use",
+            listLength(server.clients)-listLength(server.slaves),
+            listLength(server.slaves),
+            (unsigned long long)zmalloc_used_memory());
+#else
         redisLog(REDIS_VERBOSE,"%d clients connected (%d slaves), %zu bytes in use",
             listLength(server.clients)-listLength(server.slaves),
             listLength(server.slaves),
             zmalloc_used_memory());
+#endif
     }
 
     /* Close connections of timedout clients */
@@ -607,6 +626,18 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         pid_t pid;
 
         if ((pid = wait3(&statloc,WNOHANG,NULL)) != 0) {
+#ifdef LIBUV
+            if (pid == -1) {
+                /* LIBUV hides wait3 info. */
+                if (-1 != server.bgsavechildpid) {
+                    /* TODO: test if pid still running */
+                    pid = server.bgsavechildpid;
+                } else {
+                    /* TODO: test if pid still running */
+                    pid = server.bgrewritechildpid;
+                }
+            }
+#endif
             if (pid == server.bgsavechildpid) {
                 backgroundSaveDoneHandler(statloc);
             } else {
@@ -627,7 +658,13 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                 redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
                     sp->changes, sp->seconds);
                 rdbSaveBackground(server.dbfilename);
+#ifdef _WIN32
+                /* On windows this will save in foreground and block */
+                /* Here we are allready saved, and we should return */
+                return 100;
+#else
                 break;
+#endif
             }
          }
 
@@ -691,8 +728,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 /* This function gets called every time Redis is entering the
  * main loop of the event driven library, that is, before to sleep
  * for ready file descriptors. */
-void beforeSleep(struct aeEventLoop *eventLoop) {
-    REDIS_NOTUSED(eventLoop);
+void beforeSleep() {
     listNode *ln;
     redisClient *c;
 
@@ -702,15 +738,17 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
         listRewind(server.io_ready_clients,&li);
         while((ln = listNext(&li))) {
-            c = ln->value;
             struct redisCommand *cmd;
+            c = (redisClient *)ln->value;
 
             /* Resume the client. */
             listDelNode(server.io_ready_clients,ln);
             c->flags &= (~REDIS_IO_WAIT);
             server.vm_blocked_clients--;
+#ifndef LIBUV
             aeCreateFileEvent(server.el, c->fd, AE_READABLE,
                 readQueryFromClient, c);
+#endif
             cmd = lookupCommand(c->argv[0]->ptr);
             redisAssert(cmd != NULL);
             call(c);
@@ -738,11 +776,46 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     flushAppendOnlyFile(0);
 }
 
+#ifdef LIBUV
+void serverCronCb(uv_timer_t* timer, int status) {
+    REDIS_NOTUSED(timer);
+    REDIS_NOTUSED(status);
+
+    serverCron();
+}
+
+void beforeSleepCb(uv_prepare_t* handle, int status) {
+    REDIS_NOTUSED(handle);
+    REDIS_NOTUSED(status);
+
+    beforeSleep();
+}
+#else
+int serverCronCb(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    REDIS_NOTUSED(eventLoop);
+    REDIS_NOTUSED(id);
+    REDIS_NOTUSED(clientData);
+
+    return serverCron();
+}
+
+void beforeSleepCb(struct aeEventLoop *eventLoop) {
+    REDIS_NOTUSED(eventLoop);
+
+    beforeSleep();
+}
+#endif
+
 /* =========================== Server initialization ======================== */
 
 void createSharedObjects(void) {
     int j;
 
+#ifdef _WIN32
+    /* Windows fix: Init mutex objects, since they will be used un create object call */
+    pthread_mutex_init(&server.io_mutex,NULL);
+    pthread_mutex_init(&server.io_swapfile_mutex,NULL);
+#endif
     shared.crlf = createObject(REDIS_STRING,sdsnew("\r\n"));
     shared.ok = createObject(REDIS_STRING,sdsnew("+OK\r\n"));
     shared.err = createObject(REDIS_STRING,sdsnew("-ERR\r\n"));
@@ -799,8 +872,10 @@ void initServerConfig() {
     server.bindaddr = NULL;
     server.unixsocket = NULL;
     server.unixsocketperm = 0;
+#ifndef LIBUV
     server.ipfd = -1;
     server.sofd = -1;
+#endif
     server.dbnum = REDIS_DEFAULT_DBNUM;
     server.verbosity = REDIS_VERBOSE;
     server.maxidletime = REDIS_MAXIDLETIME;
@@ -834,7 +909,11 @@ void initServerConfig() {
     server.maxmemory_policy = REDIS_MAXMEMORY_VOLATILE_LRU;
     server.maxmemory_samples = 3;
     server.vm_enabled = 0;
+#ifdef _WIN32
+    server.vm_swap_file = zstrdup("redis-%p.vm");
+#else
     server.vm_swap_file = zstrdup("/tmp/redis-%p.vm");
+#endif
     server.vm_page_size = 256;          /* 256 bytes per page */
     server.vm_pages = 1024*1024*100;    /* 104 millions of pages */
     server.vm_max_memory = 1024LL*1024*1024*1; /* 1 GB of RAM */
@@ -894,19 +973,84 @@ void initServer() {
     signal(SIGPIPE, SIG_IGN);
     setupSignalHandlers();
 
+#ifndef _WIN32
     if (server.syslog_enabled) {
         openlog(server.syslog_ident, LOG_PID | LOG_NDELAY | LOG_NOWAIT,
             server.syslog_facility);
     }
+#endif
 
     server.mainthread = pthread_self();
+#ifdef _WIN32
+     /* Force binary mode on all files */
+    _fmode = _O_BINARY;
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+
+    /* Set C locale, forcing strtod() to work with dots */
+    setlocale(LC_ALL, "C");
+
+    RtlGenRandom = (RtlGenRandomFunc)GetProcAddress(LoadLibraryA("advapi32.dll"), "SystemFunction036");
+#endif
     server.clients = listCreate();
     server.slaves = listCreate();
     server.monitors = listCreate();
     server.unblocked_clients = listCreate();
     createSharedObjects();
-    server.el = aeCreateEventLoop();
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
+
+#ifdef LIBUV
+    server.uvloop = uv_default_loop();
+    server.uv_tcp_srv.data = NULL;
+    server.uv_domain.data = NULL;
+    if (server.port != 0) {
+        struct sockaddr_in addr;
+        int uvret;
+        char * bindaddr = server.bindaddr;
+        if (bindaddr == NULL) {
+            bindaddr = "0.0.0.0";
+        }
+        addr = uv_ip4_addr(bindaddr, server.port);
+        uvret = uv_tcp_init(server.uvloop, &server.uv_tcp_srv);
+        if (uvret == 0) {
+            uvret = uv_tcp_bind(&server.uv_tcp_srv, addr);
+            redisLog(REDIS_WARNING, "bind: %d", uvret);
+        }
+        if (uvret == 0) {
+            uvret = uv_listen((uv_stream_t*)&server.uv_tcp_srv, 511, acceptTcpHandler);
+            redisLog(REDIS_WARNING, "listen: %d", uvret);
+        }
+        if (uvret != 0) {
+            uv_err_t err = uv_last_error(server.uvloop);
+            redisLog(REDIS_WARNING, "Failed Opening tcp: %s %d", bindaddr, server.port);
+            strncpy(server.neterr, uv_strerror(err), sizeof(server.neterr)-1);
+            server.neterr[sizeof(server.neterr)-1] = '\0';
+            redisLog(REDIS_WARNING, "Opening port: %s", server.neterr);
+            exit(1);
+        }
+        server.uv_tcp_srv.data = &server;
+    }
+    if (server.unixsocket != NULL) {
+        int uvret;
+        uvret = uv_pipe_init(server.uvloop, &server.uv_domain, 0);
+        if (uvret == 0) {
+            uvret = uv_pipe_bind(&server.uv_domain, server.unixsocket);
+        }
+        if (uvret == 0) {
+            uvret = uv_listen((uv_stream_t*)&server.uv_domain, 511 , acceptUnixHandler);
+        }
+        if (uvret != 0) {
+            uv_err_t err = uv_last_error(server.uvloop);
+            strncpy(server.neterr, uv_strerror(err), sizeof(server.neterr)-1);
+            server.neterr[sizeof(server.neterr)-1] = '\0';
+            redisLog(REDIS_WARNING, "Opening socket: %s", server.neterr);
+            exit(1);
+        }
+        server.uv_domain.data = &server;
+    }
+#else
+    server.el = aeCreateEventLoop();
 
     if (server.port != 0) {
         server.ipfd = anetTcpServer(server.neterr,server.port,server.bindaddr);
@@ -928,6 +1072,7 @@ void initServer() {
         redisLog(REDIS_WARNING, "Configured to not listen anywhere, exiting.");
         exit(1);
     }
+#endif
     for (j = 0; j < server.dbnum; j++) {
         server.db[j].dict = dictCreate(&dbDictType,NULL);
         server.db[j].expires = dictCreate(&keyptrDictType,NULL);
@@ -958,14 +1103,24 @@ void initServer() {
     server.stat_peak_memory = 0;
     server.stat_fork_time = 0;
     server.unixtime = time(NULL);
-    aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL);
+#ifdef LIBUV
+    if (uv_timer_init(uv_default_loop(), &server.uv_cron_timer) == 0) {
+        uv_timer_start(&server.uv_cron_timer, serverCronCb, 50, 50);
+    }
+#else
+    aeCreateTimeEvent(server.el, 1, serverCronCb, NULL, NULL);
     if (server.ipfd > 0 && aeCreateFileEvent(server.el,server.ipfd,AE_READABLE,
         acceptTcpHandler,NULL) == AE_ERR) oom("creating file event");
     if (server.sofd > 0 && aeCreateFileEvent(server.el,server.sofd,AE_READABLE,
         acceptUnixHandler,NULL) == AE_ERR) oom("creating file event");
+#endif
 
     if (server.appendonly) {
+#ifdef _WIN32
+        server.appendfd = open(server.appendfilename,O_WRONLY|O_APPEND|O_CREAT|_O_BINARY,0644);
+#else
         server.appendfd = open(server.appendfilename,O_WRONLY|O_APPEND|O_CREAT,0644);
+#endif
         if (server.appendfd == -1) {
             redisLog(REDIS_WARNING, "Can't open the append-only file: %s",
                 strerror(errno));
@@ -1127,6 +1282,12 @@ int processCommand(redisClient *c) {
 
 /*================================== Shutdown =============================== */
 
+#ifdef LIBUV
+void cbClose(uv_handle_t* handle) {
+    REDIS_NOTUSED(handle);
+}
+#endif
+
 int prepareForShutdown() {
     redisLog(REDIS_WARNING,"User requested shutdown...");
     /* Kill the saving child if there is a background saving in progress.
@@ -1171,8 +1332,23 @@ int prepareForShutdown() {
         unlink(server.pidfile);
     }
     /* Close the listening sockets. Apparently this allows faster restarts. */
+#ifdef LIBUV
+    uv_timer_stop(&server.uv_cron_timer);
+    uv_prepare_stop(&server.uv_prepare_sleep);
+    if (server.uv_tcp_srv.data != NULL) {
+        uv_close((uv_handle_t*)&server.uv_tcp_srv, cbClose);
+        server.uv_tcp_srv.data = NULL;
+    }
+    if (server.uv_domain.data != NULL) {
+        uv_close((uv_handle_t*)&server.uv_domain, cbClose);
+        server.uv_domain.data = NULL;
+    }
+    uv_close((uv_handle_t*)&server.uv_cron_timer, cbClose);
+    uv_close((uv_handle_t*)&server.uv_prepare_sleep, cbClose);
+#else
     if (server.ipfd != -1) close(server.ipfd);
     if (server.sofd != -1) close(server.sofd);
+#endif
     if (server.unixsocket) {
         redisLog(REDIS_NOTICE,"Removing the unix socket file.");
         unlink(server.unixsocket); /* don't care if this fails */
@@ -1242,6 +1418,103 @@ sds genRedisInfoString(void) {
 
     bytesToHuman(hmem,zmalloc_used_memory());
     bytesToHuman(peak_hmem,server.stat_peak_memory);
+#ifdef _WIN32
+    info = sdscatprintf(sdsempty(),
+        "redis_version:%s\r\n"
+        "redis_git_sha1:%s\r\n"
+        "redis_git_dirty:%d\r\n"
+        "arch_bits:%s\r\n"
+        "multiplexing_api:%s\r\n"
+        "process_id:%ld\r\n"
+        "uptime_in_seconds:%ld\r\n"
+        "uptime_in_days:%ld\r\n"
+        "lru_clock:%ld\r\n"
+        "used_cpu_sys:%.2f\r\n"
+        "used_cpu_user:%.2f\r\n"
+        "used_cpu_sys_children:%.2f\r\n"
+        "used_cpu_user_children:%.2f\r\n"
+        "connected_clients:%d\r\n"
+        "connected_slaves:%d\r\n"
+        "client_longest_output_list:%lu\r\n"
+        "client_biggest_input_buf:%lu\r\n"
+        "blocked_clients:%d\r\n"
+        "used_memory:%llu\r\n"
+        "used_memory_human:%s\r\n"
+        "used_memory_rss:%llu\r\n"
+        "used_memory_peak:%llu\r\n"
+        "used_memory_peak_human:%s\r\n"
+        "mem_fragmentation_ratio:%.2f\r\n"
+        "mem_allocator:%s\r\n"
+        "loading:%d\r\n"
+        "aof_enabled:%d\r\n"
+        "changes_since_last_save:%lld\r\n"
+        "bgsave_in_progress:%d\r\n"
+        "last_save_time:%ld\r\n"
+        "bgrewriteaof_in_progress:%d\r\n"
+        "total_connections_received:%lld\r\n"
+        "total_commands_processed:%lld\r\n"
+        "expired_keys:%lld\r\n"
+        "evicted_keys:%lld\r\n"
+        "keyspace_hits:%lld\r\n"
+        "keyspace_misses:%lld\r\n"
+        "pubsub_channels:%lld\r\n"
+        "pubsub_patterns:%u\r\n"
+        "latest_fork_usec:%lld\r\n"
+        "vm_enabled:%d\r\n"
+        "role:%s\r\n"
+        ,REDIS_VERSION,
+        redisGitSHA1(),
+        strtol(redisGitDirty(),NULL,10) > 0,
+        (sizeof(long) == 8) ? "64" : "32",
+        aeGetApiName(),
+        (long) getpid(),
+        (long) uptime,
+        (long) uptime/(3600*24),
+        (unsigned long) server.lruclock,
+        (float)self_ru.ru_stime.tv_sec+(float)self_ru.ru_stime.tv_usec/1000000,
+        (float)self_ru.ru_utime.tv_sec+(float)self_ru.ru_utime.tv_usec/1000000,
+        (float)c_ru.ru_stime.tv_sec+(float)c_ru.ru_stime.tv_usec/1000000,
+        (float)c_ru.ru_utime.tv_sec+(float)c_ru.ru_utime.tv_usec/1000000,
+        listLength(server.clients)-listLength(server.slaves),
+        listLength(server.slaves),
+        lol, bib,
+        server.bpop_blocked_clients,
+        (long long unsigned int)zmalloc_used_memory(),
+        hmem,
+        (long long unsigned int)zmalloc_get_rss(),
+        (long long unsigned int)server.stat_peak_memory,
+        peak_hmem,
+        zmalloc_get_fragmentation_ratio(),
+        ZMALLOC_LIB,
+        server.loading,
+        server.appendonly,
+        (long long int)server.dirty,
+        server.bgsavechildpid != -1,
+        (long)server.lastsave,
+        server.bgrewritechildpid != -1,
+        (long long int)server.stat_numconnections,
+        (long long int)server.stat_numcommands,
+        (long long int)server.stat_expiredkeys,
+        (long long int)server.stat_evictedkeys,
+        (long long int)server.stat_keyspace_hits,
+        (long long int)server.stat_keyspace_misses,
+        (long long unsigned int)dictSize(server.pubsub_channels),
+        (long)listLength(server.pubsub_patterns),
+        (long long int)server.stat_fork_time,
+        server.vm_enabled != 0,
+        server.masterhost == NULL ? "master" : "slave"
+    );
+
+    if (server.appendonly) {
+        info = sdscatprintf(info,
+            "aof_current_size:%lld\r\n"
+            "aof_base_size:%lld\r\n"
+            "aof_pending_rewrite:%d\r\n",
+            (long long) server.appendonly_current_size,
+            (long long) server.auto_aofrewrite_base_size,
+            server.aofrewrite_scheduled);
+    }
+#else
     info = sdscatprintf(sdsempty(),
         "redis_version:%s\r\n"
         "redis_git_sha1:%s\r\n"
@@ -1337,6 +1610,7 @@ sds genRedisInfoString(void) {
             (long long) server.auto_aofrewrite_base_size,
             server.aofrewrite_scheduled);
     }
+#endif
 
     if (server.masterhost) {
         info = sdscatprintf(info,
@@ -1598,6 +1872,9 @@ void createPidFile(void) {
 }
 
 void daemonize(void) {
+#ifdef _WIN32
+  redisLog(REDIS_WARNING,"Windows does not support daemonize. Start Redis as service");
+#else
     int fd;
 
     if (fork() != 0) exit(0); /* parent exits */
@@ -1612,6 +1889,7 @@ void daemonize(void) {
         dup2(fd, STDERR_FILENO);
         if (fd > STDERR_FILENO) close(fd);
     }
+#endif
 }
 
 void version() {
@@ -1626,8 +1904,32 @@ void usage() {
     exit(1);
 }
 
+#ifdef LIBUV
+static time_t loadStart;
+void aofLoadComplete(int status, void *cdata) {
+    REDIS_NOTUSED(cdata);
+    if (status == REDIS_OK)
+        redisLog(REDIS_NOTICE,"DB loaded from append only file: %ld seconds",time(NULL)-loadStart);
+    uv_prepare_start(&server.uv_prepare_sleep, beforeSleepCb);
+}
+void rdbLoadComplete(int status, void *cdata) {
+    REDIS_NOTUSED(cdata);
+    if (status == REDIS_OK)
+        redisLog(REDIS_NOTICE,"DB loaded from disk: %ld seconds",time(NULL)-loadStart);
+    uv_prepare_start(&server.uv_prepare_sleep, beforeSleepCb);
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifndef LIBUV
     time_t start;
+#endif
+
+#ifdef _WIN32
+    /* using pthreads as statically linked library
+       requires initialization */
+    pthread_win32_process_attach_np();
+#endif
 
     initServerConfig();
     if (argc == 2) {
@@ -1648,6 +1950,28 @@ int main(int argc, char **argv) {
 #ifdef __linux__
     linuxOvercommitMemoryWarning();
 #endif
+#ifdef LIBUV
+    server.uv_open_handles = NULL;
+    server.uv_open_handles_size = 0;
+    server.uv_open_handles_count = 0;
+
+    loadStart = time(NULL);
+    /* start loading */
+    uv_prepare_init(server.uvloop, &server.uv_prepare_sleep);
+    if (server.appendonly) {
+        loadAppendOnlyFileStart(server.appendfilename, aofLoadComplete, NULL);
+    } else {
+        rdbLoadStart(server.dbfilename, rdbLoadComplete, NULL);
+    }
+
+    if (server.port != 0) {
+        redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
+    }
+    if (server.unixsocket != NULL) {
+        redisLog(REDIS_NOTICE,"The server is now ready to accept connections on pipe %s", server.unixsocket);
+    }
+    uv_run(server.uvloop);
+#else
     start = time(NULL);
     if (server.appendonly) {
         if (loadAppendOnlyFile(server.appendfilename) == REDIS_OK)
@@ -1665,9 +1989,15 @@ int main(int argc, char **argv) {
         redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
     if (server.sofd > 0)
         redisLog(REDIS_NOTICE,"The server is now ready to accept connections at %s", server.unixsocket);
-    aeSetBeforeSleepProc(server.el,beforeSleep);
+    aeSetBeforeSleepProc(server.el,beforeSleepCb);
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
+#endif
+#ifdef _WIN32
+    /* using pthreads as statically linked library
+       requires cleanup */
+    pthread_win32_process_detach_np();
+#endif
     return 0;
 }
 

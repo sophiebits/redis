@@ -5,7 +5,11 @@
 #include <ctype.h>
 #include <limits.h>
 #include <math.h>
+#ifndef _WIN32
 #include <sys/time.h>
+#else
+#include "win32fixes.h"
+#endif
 
 #include "util.h"
 
@@ -190,14 +194,30 @@ int ll2string(char *s, size_t len, long long value) {
     char buf[32], *p;
     unsigned long long v;
     size_t l;
+#ifdef _WIN32
+    /* if value fis in 32 bits, use 32 bit div */
+    unsigned long vl;
+#endif
 
     if (len == 0) return 0;
     v = (value < 0) ? -value : value;
     p = buf+31; /* point to the last character */
+#ifdef _WIN32
+    vl = (unsigned long)v;
+    if ((unsigned long long)vl == v) {
+        do {
+            *p-- = '0'+(vl%10);
+            vl /= 10;
+        } while(vl);
+    } else {
+#endif
     do {
         *p-- = '0'+(v%10);
         v /= 10;
     } while(v);
+#ifdef _WIN32
+    }
+#endif
     if (value < 0) *p-- = '-';
     p++;
     l = 32-(p-buf);
@@ -318,7 +338,7 @@ int d2string(char *buf, size_t len, double value) {
          * integer printing function that is much faster. */
         double min = -4503599627370495; /* (2^52)-1 */
         double max = 4503599627370496; /* -(2^52) */
-        if (val > min && val < max && value == ((double)((long long)value)))
+        if (value > min && value < max && value == ((double)((long long)value)))
             len = ll2string(buf,len,(long long)value);
         else
 #endif

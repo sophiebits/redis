@@ -42,6 +42,9 @@
 #include <ctype.h>
 #include "sds.h"
 #include "zmalloc.h"
+#ifdef _WIN32
+#include "win32fixes.h"
+#endif
 
 static void sdsOomAbort(void) {
     fprintf(stderr,"SDS: Out Of Memory (SDS_ABORT_ON_OOM defined)\n");
@@ -51,7 +54,7 @@ static void sdsOomAbort(void) {
 sds sdsnewlen(const void *init, size_t initlen) {
     struct sdshdr *sh;
 
-    sh = zmalloc(sizeof(struct sdshdr)+initlen+1);
+    sh = (struct sdshdr *)zmalloc(sizeof(struct sdshdr)+initlen+1);
 #ifdef SDS_ABORT_ON_OOM
     if (sh == NULL) sdsOomAbort();
 #else

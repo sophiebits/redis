@@ -3,10 +3,12 @@
 
 #include <math.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <arpa/inet.h>
+#endif
 #include <sys/stat.h>
 
 /* Convenience wrapper around fwrite, that returns the number of bytes written
@@ -406,7 +408,7 @@ int rdbSave(char *filename) {
         waitEmptyIOJobsQueue();
 
     snprintf(tmpfile,256,"temp-%d.rdb", (int) getpid());
-    fp = fopen(tmpfile,"w");
+    fp = fopen(tmpfile,REDIS_FOPENWRITE);
     if (!fp) {
         redisLog(REDIS_WARNING, "Failed saving the DB: %s", strerror(errno));
         return REDIS_ERR;
@@ -496,6 +498,25 @@ werr:
     return REDIS_ERR;
 }
 
+#ifdef _WIN32
+int rdbSaveBackground(char *filename) {
+    long long start;
+
+    if (server.bgsavechildpid != -1) return REDIS_ERR;
+    if (server.vm_enabled) waitEmptyIOJobsQueue();
+    server.dirty_before_bgsave = server.dirty;
+    start = ustime();
+    if (server.vm_enabled) vmReopenSwapFile();
+    server.bgsavechildpid = getpid();
+    if (rdbSave(filename) == REDIS_OK) {
+        backgroundSaveDoneHandler(0);
+        return REDIS_OK;
+    } else {
+        backgroundSaveDoneHandler(0x100);
+        return REDIS_ERR;
+    }
+}
+#else
 int rdbSaveBackground(char *filename) {
     pid_t childpid;
     long long start;
@@ -507,8 +528,19 @@ int rdbSaveBackground(char *filename) {
     if ((childpid = fork()) == 0) {
         /* Child */
         if (server.vm_enabled) vmReopenSwapFile();
+#ifdef LIBUV
+        if (server.uv_tcp_srv.data != NULL) {
+            uv_close((uv_handle_t*)&server.uv_tcp_srv, NULL);
+            server.uv_tcp_srv.data = NULL;
+        }
+        if (server.uv_domain.data != NULL) {
+            uv_close((uv_handle_t*)&server.uv_domain, NULL);
+            server.uv_domain.data = NULL;
+        }
+#else
         if (server.ipfd > 0) close(server.ipfd);
         if (server.sofd > 0) close(server.sofd);
+#endif
         if (rdbSave(filename) == REDIS_OK) {
             _exit(0);
         } else {
@@ -529,6 +561,7 @@ int rdbSaveBackground(char *filename) {
     }
     return REDIS_OK; /* unreached */
 }
+#endif
 
 void rdbRemoveTempFile(pid_t childpid) {
     char tmpfile[256];
@@ -926,38 +959,16 @@ void stopLoading(void) {
     server.loading = 0;
 }
 
-int rdbLoad(char *filename) {
-    FILE *fp;
+/* main loop for rdbLoad
+   Returns periodically to allow other events to run
+  Return code 0 means complete, 1 means more work to do */
+int rdbLoadLoop(FILE* fp, time_t now, redisDb **dbp, int *swap_all_values) {
     uint32_t dbid;
-    int type, rdbver;
-    int swap_all_values = 0;
-    redisDb *db = server.db+0;
-    char buf[1024];
-    time_t expiretime, now = time(NULL);
+    int type;
+    time_t expiretime;
     long loops = 0;
+    redisDb *db = *dbp;
 
-    fp = fopen(filename,"r");
-    if (!fp) {
-        errno = ENOENT;
-        return REDIS_ERR;
-    }
-    if (fread(buf,9,1,fp) == 0) goto eoferr;
-    buf[9] = '\0';
-    if (memcmp(buf,"REDIS",5) != 0) {
-        fclose(fp);
-        redisLog(REDIS_WARNING,"Wrong signature trying to load DB from file");
-        errno = EINVAL;
-        return REDIS_ERR;
-    }
-    rdbver = atoi(buf+5);
-    if (rdbver < 1 || rdbver > 2) {
-        fclose(fp);
-        redisLog(REDIS_WARNING,"Can't handle RDB format version %d",rdbver);
-        errno = EINVAL;
-        return REDIS_ERR;
-    }
-
-    startLoading(fp);
     while(1) {
         robj *key, *val;
         int force_swapout;
@@ -965,9 +976,10 @@ int rdbLoad(char *filename) {
         expiretime = -1;
 
         /* Serve the clients from time to time */
-        if (!(loops++ % 1000)) {
+        if (loops++ > 1000) {
             loadingProgress(ftello(fp));
-            aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
+            *dbp = db;
+            return 1;
         }
 
         /* Read type. */
@@ -1012,7 +1024,7 @@ int rdbLoad(char *filename) {
          * Note that's important to check for this condition before resorting
          * to random sampling, otherwise we may try to swap already
          * swapped keys. */
-        if (swap_all_values) {
+        if (*swap_all_values) {
             dictEntry *de = dictFind(db->dict,key->ptr);
 
             /* de may be NULL since the key already expired */
@@ -1036,14 +1048,156 @@ int rdbLoad(char *filename) {
 
         /* If we have still some hope of having some value fitting memory
          * then we try random sampling. */
-        if (!swap_all_values && server.vm_enabled && force_swapout) {
+        if (!*swap_all_values && server.vm_enabled && force_swapout) {
             while (zmalloc_used_memory() > server.vm_max_memory) {
                 if (vmSwapOneObjectBlocking() == REDIS_ERR) break;
             }
             if (zmalloc_used_memory() > server.vm_max_memory)
-                swap_all_values = 1; /* We are already using too much mem */
+                *swap_all_values = 1; /* We are already using too much mem */
         }
     }
+    *dbp = db;
+    return 0;
+
+eoferr: /* unexpected end of file is handled here with a fatal exit */
+    redisLog(REDIS_WARNING,"Short read or OOM loading DB. Unrecoverable error, aborting now.");
+    exit(1);
+    return REDIS_ERR; /* Just to avoid warning */
+}
+
+#ifdef LIBUV
+typedef struct rdbLoadState {
+    FILE *fp;
+    int swap_all_values;
+    redisDb *db;
+    time_t now;
+    loadDoneCb cb;
+    void* cdata;
+} RdbLoadState;
+
+/* rdbLoad continuation routine. rdbLoadStart begins loading
+   but returns to event loop to allow other activity to run.
+   rdbLoadCont is called from event loop to continue loading.
+*/
+void rdbLoadCont(uv_idle_t* idleHandle, int status) {
+    RdbLoadState *rdbState;
+    FILE *fp;
+    loadDoneCb cb;
+    void* cdata;
+    REDIS_NOTUSED(status);
+
+    rdbState = (RdbLoadState *)idleHandle->data;
+    fp = rdbState->fp;
+
+    if (rdbLoadLoop(fp, rdbState->now, &rdbState->db, &rdbState->swap_all_values) == 1) {
+        return;
+    }
+
+    fclose(fp);
+    stopLoading();
+    /* don't need to be called from event loop anymore */
+    uv_idle_stop(idleHandle);
+    cb = rdbState->cb;
+    cdata = rdbState->cdata;
+    zfree(rdbState);
+    zfree(idleHandle);
+
+    /* callback to inform completion */
+    if (cb != NULL)
+        cb(REDIS_OK, cdata);
+    return;
+}
+
+
+int rdbLoadStart(char * filename, loadDoneCb cb, void * cdata) {
+    int rdbver;
+    char buf[1024];
+    RdbLoadState *rdbState;
+    uv_idle_t *idleHandle;
+
+    /* set up idle handler and rdbload state so
+      that this can return to event loop periodically */
+    rdbState = zmalloc(sizeof(RdbLoadState));
+
+    rdbState->fp = fopen(filename,REDIS_FOPENREAD);
+    if (!rdbState->fp) {
+        errno = ENOENT;
+        return REDIS_ERR;
+    }
+    rdbState->swap_all_values = 0;
+    rdbState->db = server.db+0;
+    rdbState->now = time(NULL);
+    rdbState->cb = cb;
+    rdbState->cdata = cdata;
+
+    if (fread(buf,9,1,rdbState->fp) == 0) goto eoferr;
+    buf[9] = '\0';
+    if (memcmp(buf,"REDIS",5) != 0) {
+        fclose(rdbState->fp);
+        zfree(rdbState);
+        redisLog(REDIS_WARNING,"Wrong signature trying to load DB from file");
+        errno = EINVAL;
+        return REDIS_ERR;
+    }
+    rdbver = atoi(buf+5);
+    if (rdbver < 1 || rdbver > 2) {
+        fclose(rdbState->fp);
+        zfree(rdbState);
+        redisLog(REDIS_WARNING,"Can't handle RDB format version %d",rdbver);
+        errno = EINVAL;
+        return REDIS_ERR;
+    }
+
+    idleHandle = zmalloc(sizeof(uv_idle_t));
+    idleHandle->data = rdbState;
+    uv_idle_init(server.uvloop, idleHandle);
+    uv_idle_start(idleHandle, rdbLoadCont);
+
+    startLoading(rdbState->fp);
+
+    return REDIS_OK;
+
+eoferr: /* unexpected end of file is handled here with a fatal exit */
+    redisLog(REDIS_WARNING,"Short read or OOM loading DB. Unrecoverable error, aborting now.");
+    exit(1);
+}
+
+#else
+int rdbLoad(char *filename) {
+    FILE *fp;
+    int rdbver;
+    int swap_all_values = 0;
+    redisDb *db = server.db+0;
+    char buf[1024];
+    time_t now = time(NULL);
+
+    fp = fopen(filename,REDIS_FOPENREAD);
+    if (!fp) {
+        errno = ENOENT;
+        return REDIS_ERR;
+    }
+    if (fread(buf,9,1,fp) == 0) goto eoferr;
+    buf[9] = '\0';
+    if (memcmp(buf,"REDIS",5) != 0) {
+        fclose(fp);
+        redisLog(REDIS_WARNING,"Wrong signature trying to load DB from file");
+        errno = EINVAL;
+        return REDIS_ERR;
+    }
+    rdbver = atoi(buf+5);
+    if (rdbver < 1 || rdbver > 2) {
+        fclose(fp);
+        redisLog(REDIS_WARNING,"Can't handle RDB format version %d",rdbver);
+        errno = EINVAL;
+        return REDIS_ERR;
+    }
+
+    startLoading(fp);
+
+    while (rdbLoadLoop(fp, now, &db, &swap_all_values) == 1) {
+        aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
+    }
+
     fclose(fp);
     stopLoading();
     return REDIS_OK;
@@ -1053,6 +1207,7 @@ eoferr: /* unexpected end of file is handled here with a fatal exit */
     exit(1);
     return REDIS_ERR; /* Just to avoid warning */
 }
+#endif
 
 /* A background saving child (BGSAVE) terminated its work. Handle this. */
 void backgroundSaveDoneHandler(int statloc) {

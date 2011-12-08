@@ -5,9 +5,11 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
+#endif
 
 void aofUpdateCurrentSize(void);
 
@@ -27,10 +29,14 @@ void stopAppendOnly(void) {
     server.appendonly = 0;
     /* rewrite operation in progress? kill it, wait child exit */
     if (server.bgrewritechildpid != -1) {
+#ifdef _WIN32
+        // fork did nothing. Nothing to kill
+#else
         int statloc;
 
         if (kill(server.bgrewritechildpid,SIGKILL) != -1)
             wait3(&statloc,0,NULL);
+#endif
         /* reset the buffer accumulating changes while the child saves */
         sdsfree(server.bgrewritebuf);
         server.bgrewritebuf = sdsempty();
@@ -43,7 +49,11 @@ void stopAppendOnly(void) {
 int startAppendOnly(void) {
     server.appendonly = 1;
     server.lastfsync = time(NULL);
+#ifdef _WIN32
+    server.appendfd = open(server.appendfilename,O_WRONLY|O_APPEND|O_CREAT|_O_BINARY,0644);
+#else
     server.appendfd = open(server.appendfilename,O_WRONLY|O_APPEND|O_CREAT,0644);
+#endif
     if (server.appendfd == -1) {
         redisLog(REDIS_WARNING,"Used tried to switch on AOF via CONFIG, but I can't open the AOF file: %s",strerror(errno));
         return REDIS_ERR;
@@ -187,7 +197,7 @@ sds catAppendOnlyExpireAtCommand(sds buf, robj *key, robj *seconds) {
 
     /* Make sure we can use strtol */
     seconds = getDecodedObject(seconds);
-    when = time(NULL)+strtol(seconds->ptr,NULL,10);
+    when = time(NULL)+strtol((char *)seconds->ptr,NULL,10);
     decrRefCount(seconds);
 
     argv[0] = createStringObject("EXPIREAT",8);
@@ -251,7 +261,12 @@ struct redisClient *createFakeClient(void) {
     struct redisClient *c = zmalloc(sizeof(*c));
 
     selectDb(c,0);
+#ifdef LIBUV
+    c->stream = NULL;
+    c->cbpending = 0;
+#else
     c->fd = -1;
+#endif
     c->querybuf = sdsempty();
     c->argc = 0;
     c->argv = NULL;
@@ -276,33 +291,11 @@ void freeFakeClient(struct redisClient *c) {
     zfree(c);
 }
 
-/* Replay the append log file. On error REDIS_OK is returned. On non fatal
- * error (the append only file is zero-length) REDIS_ERR is returned. On
- * fatal error an error message is logged and the program exists. */
-int loadAppendOnlyFile(char *filename) {
-    struct redisClient *fakeClient;
-    FILE *fp = fopen(filename,"r");
-    struct redis_stat sb;
-    int appendonly = server.appendonly;
+/* main loop for loadAppendOnlyFile
+  Returns periodically to allow other actions to take place.
+  Return code 0 means complete, 1 means more work to do */
+int loadAppendOnlyFileLoop(FILE *fp, struct redisClient *fakeClient) {
     long loops = 0;
-
-    if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
-        server.appendonly_current_size = 0;
-        fclose(fp);
-        return REDIS_ERR;
-    }
-
-    if (fp == NULL) {
-        redisLog(REDIS_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
-        exit(1);
-    }
-
-    /* Temporarily disable AOF, to prevent EXEC from feeding a MULTI
-     * to the same file we're about to read. */
-    server.appendonly = 0;
-
-    fakeClient = createFakeClient();
-    startLoading(fp);
 
     while(1) {
         int argc, j;
@@ -314,9 +307,9 @@ int loadAppendOnlyFile(char *filename) {
         int force_swapout;
 
         /* Serve the clients from time to time */
-        if (!(loops++ % 1000)) {
+        if (loops++ > 1000) {
             loadingProgress(ftello(fp));
-            aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
+            return 1;
         }
 
         if (fgets(buf,sizeof(buf),fp) == NULL) {
@@ -373,18 +366,10 @@ int loadAppendOnlyFile(char *filename) {
             }
         }
     }
-
     /* This point can only be reached when EOF is reached without errors.
      * If the client is in the middle of a MULTI/EXEC, log error and quit. */
     if (fakeClient->flags & REDIS_MULTI) goto readerr;
-
-    fclose(fp);
-    freeFakeClient(fakeClient);
-    server.appendonly = appendonly;
-    stopLoading();
-    aofUpdateCurrentSize();
-    server.auto_aofrewrite_base_size = server.appendonly_current_size;
-    return REDIS_OK;
+    return 0;
 
 readerr:
     if (feof(fp)) {
@@ -397,6 +382,142 @@ fmterr:
     redisLog(REDIS_WARNING,"Bad file format reading the append only file: make a backup of your AOF file, then use ./redis-check-aof --fix <filename>");
     exit(1);
 }
+
+#ifdef LIBUV
+typedef struct aofLoadState {
+    FILE *fp;
+    int appendonly;
+    struct redisClient *fakeClient;
+    loadDoneCb cb;
+    void *cdata;
+} AofLoadState;
+
+/* loadAppendOnlyFile continuation routine. loadAppendOnlyFileStart begins loading
+   but returns to event loop to allow other activity to run.
+   loadAppendOnlyFileCont is called from event loop to continue loading.
+*/
+void loadAppendOnlyFileCont(uv_idle_t* idleHandle, int status) {
+    FILE *fp;
+    struct redisClient *fakeClient;
+    AofLoadState *aofState;
+    loadDoneCb cb;
+    void *cdata;
+    REDIS_NOTUSED(status);
+
+    /* restore state */
+    aofState = (AofLoadState *)idleHandle->data;
+    fp = aofState->fp;
+    fakeClient = aofState->fakeClient;
+
+    if (loadAppendOnlyFileLoop(fp, fakeClient) == 1) {
+        /* more work to do. This will be called again from event loop */
+        return;
+    }
+
+    fclose(fp);
+    freeFakeClient(fakeClient);
+    server.appendonly = aofState->appendonly;
+    stopLoading();
+    aofUpdateCurrentSize();
+    server.auto_aofrewrite_base_size = server.appendonly_current_size;
+
+    /* don't need to be called from event loop anymore */
+    uv_idle_stop(idleHandle);
+    cb = aofState->cb;
+    cdata = aofState->cdata;
+    zfree(aofState);
+    zfree(idleHandle);
+
+    if (cb != NULL)
+        cb(REDIS_OK, cdata);
+    return;
+}
+
+/* Replay the append log file. On error REDIS_OK is returned. On non fatal
+ * error (the append only file is zero-length) REDIS_ERR is returned. On
+ * fatal error an error message is logged and the program exists. */
+int loadAppendOnlyFileStart(char *filename, loadDoneCb cb, void *cdata) {
+    FILE *fp = fopen(filename,REDIS_FOPENREAD);
+    struct redis_stat sb;
+    AofLoadState *aofState;
+    uv_idle_t *idleHandle;
+
+    if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
+        server.appendonly_current_size = 0;
+        fclose(fp);
+        return REDIS_ERR;
+    }
+
+    if (fp == NULL) {
+        redisLog(REDIS_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
+        exit(1);
+    }
+
+    /* save state for continuation routine to use */
+    aofState = zmalloc(sizeof(AofLoadState));
+    aofState->fp = fp;
+    aofState->appendonly = server.appendonly;
+    aofState->fakeClient = createFakeClient();
+    aofState->cb = cb;
+    aofState->cdata = cdata;
+
+    idleHandle = zmalloc(sizeof(uv_idle_t));
+    idleHandle->data = aofState;
+    uv_idle_init(server.uvloop, idleHandle);
+    uv_idle_start(idleHandle, loadAppendOnlyFileCont);
+
+    /* Temporarily disable AOF, to prevent EXEC from feeding a MULTI
+     * to the same file we're about to read. */
+    server.appendonly = 0;
+
+    startLoading(fp);
+
+    return REDIS_OK;
+}
+#else
+/* Replay the append log file. On error REDIS_OK is returned. On non fatal
+ * error (the append only file is zero-length) REDIS_ERR is returned. On
+ * fatal error an error message is logged and the program exists. */
+int loadAppendOnlyFile(char *filename) {
+    struct redisClient *fakeClient;
+    FILE *fp = fopen(filename,REDIS_FOPENREAD);
+    struct redis_stat sb;
+    int appendonly = server.appendonly;
+
+    if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
+        server.appendonly_current_size = 0;
+        fclose(fp);
+        return REDIS_ERR;
+    }
+
+    if (fp == NULL) {
+        redisLog(REDIS_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
+        exit(1);
+    }
+
+    /* Temporarily disable AOF, to prevent EXEC from feeding a MULTI
+     * to the same file we're about to read. */
+    server.appendonly = 0;
+
+    fakeClient = createFakeClient();
+    startLoading(fp);
+
+    while (loadAppendOnlyFileLoop(fp, fakeClient) == 1) {
+        /* more work to do. Serve the clients before continuing */
+        aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
+    }
+
+    fclose(fp);
+    freeFakeClient(fakeClient);
+    server.appendonly = appendonly;
+    stopLoading();
+    aofUpdateCurrentSize();
+    server.auto_aofrewrite_base_size = server.appendonly_current_size;
+    return REDIS_OK;
+
+}
+#endif
+
 
 /* Write a sequence of commands able to fully rebuild the dataset into
  * "filename". Used both by REWRITEAOF and BGREWRITEAOF. */
@@ -411,7 +532,7 @@ int rewriteAppendOnlyFile(char *filename) {
     /* Note that we have to use a different temp name here compared to the
      * one used by rewriteAppendOnlyFileBackground() function. */
     snprintf(tmpfile,256,"temp-rewriteaof-%d.aof", (int) getpid());
-    fp = fopen(tmpfile,"w");
+    fp = fopen(tmpfile,REDIS_FOPENWRITE);
     if (!fp) {
         redisLog(REDIS_WARNING, "Failed rewriting the append only file: %s", strerror(errno));
         return REDIS_ERR;
@@ -672,8 +793,19 @@ int rewriteAppendOnlyFileBackground(void) {
 
         /* Child */
         if (server.vm_enabled) vmReopenSwapFile();
+#ifdef LIBUV
+        if (server.uv_tcp_srv.data != NULL) {
+            uv_close((uv_handle_t*)&server.uv_tcp_srv, NULL);
+            server.uv_tcp_srv.data = NULL;
+        }
+        if (server.uv_domain.data != NULL) {
+            uv_close((uv_handle_t*)&server.uv_domain, NULL);
+            server.uv_domain.data = NULL;
+        }
+#else
         if (server.ipfd > 0) close(server.ipfd);
         if (server.sofd > 0) close(server.sofd);
+#endif
         snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof", (int) getpid());
         if (rewriteAppendOnlyFile(tmpfile) == REDIS_OK) {
             _exit(0);
@@ -683,6 +815,32 @@ int rewriteAppendOnlyFileBackground(void) {
     } else {
         /* Parent */
         server.stat_fork_time = ustime()-start;
+#ifdef _WIN32
+        if (childpid == -1) {
+            char tmpfile[256];
+
+            childpid = getpid();
+            snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof", childpid);
+            server.aofrewrite_scheduled = 0;
+            server.bgrewritechildpid = childpid;
+            updateDictResizePolicy();
+            server.appendseldb = -1;
+
+            redisLog(REDIS_NOTICE,
+                "Foreground append only file rewriting started by pid %d", childpid);
+
+            if (rewriteAppendOnlyFile(tmpfile) == REDIS_OK) {
+                backgroundRewriteDoneHandler(0);
+                return REDIS_OK;
+            } else {
+                backgroundRewriteDoneHandler(0xff);
+                redisLog(REDIS_WARNING,
+                    "Can't rewrite append only file in background: spoon: %s",
+                    strerror(errno));
+                return REDIS_ERR;
+            }
+        }
+#else
         if (childpid == -1) {
             redisLog(REDIS_WARNING,
                 "Can't rewrite append only file in background: fork: %s",
@@ -700,6 +858,7 @@ int rewriteAppendOnlyFileBackground(void) {
          * with a SELECT statement and it will be safe to merge. */
         server.appendseldb = -1;
         return REDIS_OK;
+#endif
     }
     return REDIS_OK; /* unreached */
 }
@@ -731,6 +890,12 @@ void aofRemoveTempFile(pid_t childpid) {
 void aofUpdateCurrentSize(void) {
     struct redis_stat sb;
 
+#ifdef _WIN32
+    if (server.appendfd == -1) {
+        redisLog(REDIS_WARNING,"Unable to check the AOF length: %s", "appendfd is -1");
+        return;
+    }
+#endif
     if (redis_fstat(server.appendfd,&sb) == -1) {
         redisLog(REDIS_WARNING,"Unable to check the AOF length: %s",
             strerror(errno));
@@ -750,6 +915,9 @@ void backgroundRewriteDoneHandler(int statloc) {
         int nwritten;
         char tmpfile[256];
         long long now = ustime();
+#ifdef _WIN32
+        char tmpfile_old[256];
+#endif
 
         redisLog(REDIS_NOTICE,
             "Background AOF rewrite terminated with success");
@@ -758,7 +926,11 @@ void backgroundRewriteDoneHandler(int statloc) {
          * rewritten AOF. */
         snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof",
             (int)server.bgrewritechildpid);
+#ifdef _WIN32
+        newfd = open(tmpfile,O_WRONLY|O_APPEND|_O_BINARY);
+#else
         newfd = open(tmpfile,O_WRONLY|O_APPEND);
+#endif
         if (newfd == -1) {
             redisLog(REDIS_WARNING,
                 "Unable to open the temporary AOF produced by the child: %s", strerror(errno));
@@ -808,6 +980,44 @@ void backgroundRewriteDoneHandler(int statloc) {
          * guarantee atomicity for this switch has already happened by then, so
          * we don't care what the outcome or duration of that close operation
          * is, as long as the file descriptor is released again. */
+#ifdef _WIN32
+        oldfd = -1; /* We'll set this to the current AOF filedes later. */
+
+        /* Close files before renaming */
+        close(newfd);
+        if (server.appendfd != -1) close(server.appendfd);
+        /* now rename the existing file to allow new file to be renamed */
+        snprintf(tmpfile_old,256,"temp-rewriteaof-old-%d.aof",
+            (int)server.bgrewritechildpid);
+        if (server.appendfd != -1) {
+            if (rename(server.appendfilename, tmpfile_old) == -1) {
+                redisLog(REDIS_WARNING,
+                    "Error trying to rename the existing AOF to old tempfile: %s", strerror(errno));
+            }
+        }
+        if (rename(tmpfile,server.appendfilename) == -1) {
+            redisLog(REDIS_WARNING,
+                "Error trying to rename the temporary AOF: %s", strerror(errno));
+            if (server.appendfd != -1) {
+                if (rename(tmpfile_old, server.appendfilename) == -1) {
+                    redisLog(REDIS_WARNING,
+                        "Error trying to rename the existing AOF from old tempfile: %s", strerror(errno));
+                }
+            }
+            if (oldfd != -1) close(oldfd);
+            goto cleanup;
+        }
+        /* now open the files again with new names */
+        newfd = open(server.appendfilename, O_WRONLY|O_APPEND|_O_BINARY);
+        if (newfd == -1) {
+            /* Windows fix: More info */
+            redisLog(REDIS_WARNING, "Not able to reopen the temporary AOF file after rename");
+            goto cleanup;
+        }
+        if (server.appendfd != -1) {
+            server.appendfd = open(tmpfile_old, O_WRONLY|O_APPEND|O_CREAT|_O_BINARY,0644);
+        }
+#else
         if (server.appendfd == -1) {
             /* AOF disabled */
 
@@ -829,6 +1039,7 @@ void backgroundRewriteDoneHandler(int statloc) {
             if (oldfd != -1) close(oldfd);
             goto cleanup;
         }
+#endif
 
         if (server.appendfd == -1) {
             /* AOF disabled, we don't need to set the AOF file descriptor

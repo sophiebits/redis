@@ -34,6 +34,10 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
+#ifdef _WIN32
+#define inline __inline
+#endif
+
 typedef char *sds;
 
 struct sdshdr {
@@ -66,11 +70,15 @@ sds sdscpylen(sds s, char *t, size_t len);
 sds sdscpy(sds s, char *t);
 
 sds sdscatvprintf(sds s, const char *fmt, va_list ap);
+#ifdef _WIN32 
+  sds sdscatprintf(sds s, const char *fmt, ...);
+#else
 #ifdef __GNUC__
 sds sdscatprintf(sds s, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 #else
 sds sdscatprintf(sds s, const char *fmt, ...);
+#endif
 #endif
 
 sds sdstrim(sds s, const char *cset);

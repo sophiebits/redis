@@ -2,12 +2,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#endif
+
 #include "hiredis.h"
 
 int main(void) {
     unsigned int j;
     redisContext *c;
     redisReply *reply;
+#ifdef _WIN32  
+    WSADATA t_wsa; 
+    WORD wVers = MAKEWORD(2, 2); // Set the version number to 2.2
+    int iError = WSAStartup(wVers, &t_wsa); 
+
+    if(iError != NO_ERROR || LOBYTE(t_wsa.wVersion) != 2 || HIBYTE(t_wsa.wVersion) != 2 ) {
+       printf("Winsock2 init error: %d\n", iError);
+       exit(1);
+    }
+    
+    atexit((void(*)(void)) WSACleanup);
+#endif    
 
     struct timeval timeout = { 1, 500000 }; // 1.5 seconds
     c = redisConnectWithTimeout((char*)"127.0.0.2", 6379, timeout);

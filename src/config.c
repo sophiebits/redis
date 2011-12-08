@@ -35,7 +35,7 @@ void loadServerConfig(char *filename) {
     if (filename[0] == '-' && filename[1] == '\0')
         fp = stdin;
     else {
-        if ((fp = fopen(filename,"r")) == NULL) {
+        if ((fp = fopen(filename,REDIS_FOPENREAD)) == NULL) {
             redisLog(REDIS_WARNING, "Fatal error, can't open config file '%s'", filename);
             exit(1);
         }

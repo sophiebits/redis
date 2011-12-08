@@ -33,9 +33,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifndef _WIN32
 #include <unistd.h>
-#include <errno.h>
 #include <sys/time.h>
+#endif
+#include <errno.h>
 #include <signal.h>
 #include <assert.h>
 
@@ -44,11 +46,20 @@
 #include "sds.h"
 #include "adlist.h"
 #include "zmalloc.h"
+#ifdef _WIN32
+#include "win32fixes.h"
+#endif
+#ifdef LIBUV
+#include "uv.h"
+#endif
 
 #define REDIS_NOTUSED(V) ((void) V)
 
 static struct config {
     aeEventLoop *el;
+#ifdef LIBUV
+    uv_loop_t *uvloop;
+#endif
     const char *hostip;
     int hostport;
     const char *hostsocket;
@@ -74,6 +85,15 @@ static struct config {
 
 typedef struct _client {
     redisContext *context;
+#ifdef LIBUV
+    uv_connect_t connect_req;
+    uv_write_t wreq;
+    uv_tcp_t uv_tcp_strm;
+    uv_pipe_t uv_pipe_strm;
+    uv_stream_t *uv_strm;
+    uv_buf_t bufs[1];
+    char rbuf[2048];
+#endif
     sds obuf;
     char *randptr[10]; /* needed for MSET against 10 keys */
     size_t randlen;
@@ -107,13 +127,27 @@ static long long mstime(void) {
     return mst;
 }
 
+#ifdef LIBUV
+void closeCb(uv_handle_t* handle) {
+    client c = (client)handle->data;
+    zfree(c);
+}
+#endif
+
 static void freeClient(client c) {
     listNode *ln;
+#ifdef LIBUV
+    uv_close((uv_handle_t *)c->uv_strm, closeCb);
+    redisFree(c->context);
+    sdsfree(c->obuf);
+    /* free client in callback */
+#else
     aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
     aeDeleteFileEvent(config.el,c->context->fd,AE_READABLE);
     redisFree(c->context);
     sdsfree(c->obuf);
     zfree(c);
+#endif
     config.liveclients--;
     ln = listSearchKey(config.clients,c);
     assert(ln != NULL);
@@ -131,10 +165,16 @@ static void freeAllClients(void) {
 }
 
 static void resetClient(client c) {
+#ifdef LIBUV
+    c->written = 0;
+    uv_read_stop(c->uv_strm);
+    writeHandler(NULL, 0, c, 0);
+#else
     aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
     aeDeleteFileEvent(config.el,c->context->fd,AE_READABLE);
     aeCreateFileEvent(config.el,c->context->fd,AE_WRITABLE,writeHandler,c);
     c->written = 0;
+#endif
 }
 
 static void randomizeClientKey(client c) {
@@ -143,7 +183,11 @@ static void randomizeClientKey(client c) {
 
     for (i = 0; i < c->randlen; i++) {
         r = random() % config.randomkeys_keyspacelen;
+#ifdef _WIN32
+        snprintf(buf,sizeof(buf),"%012lu",(long unsigned)r);
+#else
         snprintf(buf,sizeof(buf),"%012zu",r);
+#endif
         memcpy(c->randptr[i],buf,12);
     }
 }
@@ -151,7 +195,9 @@ static void randomizeClientKey(client c) {
 static void clientDone(client c) {
     if (config.requests_finished == config.requests) {
         freeClient(c);
+#ifndef LIBUV
         aeStop(config.el);
+#endif
         return;
     }
     if (config.keepalive) {
@@ -164,6 +210,64 @@ static void clientDone(client c) {
     }
 }
 
+/* common read handling used by Libuv and regular */
+static void readReplyReady(client c) {
+    void *reply = NULL;
+
+    if (redisGetReply(c->context,&reply) != REDIS_OK) {
+        fprintf(stderr,"Error: %s\n",c->context->errstr);
+        exit(1);
+    }
+    if (reply != NULL) {
+        if (reply == (void*)REDIS_REPLY_ERROR) {
+            fprintf(stderr,"Unexpected error reply, exiting...\n");
+            exit(1);
+        }
+
+        if (config.requests_finished < config.requests)
+            config.latency[config.requests_finished++] = c->latency;
+        clientDone(c);
+    }
+}
+
+#ifdef LIBUV
+void readDone(uv_stream_t *stream, ssize_t nread, uv_buf_t buf) {
+    client c = (client) stream->data;
+
+    if (nread < 0)  {
+        uv_err_t err = uv_last_error(config.uvloop);
+        errno = err.sys_errno_;
+        fprintf(stderr,"Reading from client: %s\n",c->context->errstr);
+        exit(1);
+    }
+    /* Calculate latency only for the first read event. This means that the
+     * server already sent the reply and we need to parse it. Parsing overhead
+     * is not part of the latency, so calculate it only once, here. */
+    if (c->latency < 0) c->latency = ustime()-(c->start);
+
+    if (redisBufferReadDone(c->context, buf.base, nread) != REDIS_OK) {
+        fprintf(stderr,"Error: %s\n",c->context->errstr);
+        exit(1);
+    } else {
+        readReplyReady(c);
+    }
+}
+
+static uv_buf_t readbuf_alloc(uv_handle_t *handle, size_t suggested_size) {
+    client c = (client) handle->data;
+    return uv_buf_init(c->rbuf, 2048);
+}
+
+static void writeCb(uv_write_t *req, int status) {
+    client c = (client)req->data;
+    if (status != 0) {
+        uv_err_t err = uv_last_error(config.uvloop);
+        errno = err.sys_errno_;
+        fprintf(stderr, "Writing to socket: %s\n", strerror(errno));
+        freeClient(c);
+    }
+}
+#else
 static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
     void *reply = NULL;
@@ -180,22 +284,10 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         fprintf(stderr,"Error: %s\n",c->context->errstr);
         exit(1);
     } else {
-        if (redisGetReply(c->context,&reply) != REDIS_OK) {
-            fprintf(stderr,"Error: %s\n",c->context->errstr);
-            exit(1);
-        }
-        if (reply != NULL) {
-            if (reply == (void*)REDIS_REPLY_ERROR) {
-                fprintf(stderr,"Unexpected error reply, exiting...\n");
-                exit(1);
-            }
-
-            if (config.requests_finished < config.requests)
-                config.latency[config.requests_finished++] = c->latency;
-            clientDone(c);
-        }
+        readReplyReady(c);
     }
 }
+#endif
 
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
@@ -219,6 +311,26 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     if (sdslen(c->obuf) > c->written) {
         void *ptr = c->obuf+c->written;
+#ifdef LIBUV
+        c->bufs[0] = uv_buf_init(ptr, sdslen(c->obuf)-c->written);
+        c->wreq.data = c;
+        if (uv_write(&c->wreq, c->uv_strm, c->bufs, 1, writeCb) != 0) {
+            uv_err_t err = uv_last_error(config.uvloop);
+            errno = err.sys_errno_;
+            fprintf(stderr, "Writing to socket: %s\n", strerror(errno));
+            freeClient(c);
+            return;
+        } else {
+            c->written += sdslen(c->obuf)-c->written;
+            /* Enable reading */
+            if (uv_read_start(c->uv_strm, readbuf_alloc, readDone) != 0) {
+                uv_err_t err = uv_last_error(config.uvloop);
+                errno = err.sys_errno_;
+                fprintf(stderr, "Starting to read: %s\n", strerror(errno));
+                freeClient(c);
+            }
+        }
+#else
         int nwritten = write(c->context->fd,ptr,sdslen(c->obuf)-c->written);
         if (nwritten == -1) {
             if (errno != EPIPE)
@@ -231,11 +343,65 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
             aeCreateFileEvent(config.el,c->context->fd,AE_READABLE,readHandler,c);
         }
+#endif
     }
 }
 
+#ifdef LIBUV
+static void connectCb(uv_connect_t *req, int status) {
+    if (status != UV_OK) {
+        uv_err_t err = uv_last_error(config.uvloop);
+        errno = err.sys_errno_;
+        fprintf(stderr,"Could not connect to Redis at ");
+        if (config.hostsocket == NULL)
+            fprintf(stderr,"%s:%d: %s\n",config.hostip,config.hostport,strerror(errno));
+        else
+            fprintf(stderr,"%s: %s\n",config.hostsocket,strerror(errno));
+        exit(1);
+    }
+    
+    writeHandler(NULL, 0, req->handle->data, 0);
+}
+
+static void connectUv(client c) {
+    int uvret;
+    if (config.hostsocket == NULL) {
+        struct sockaddr_in addr = uv_ip4_addr(config.hostip, config.hostport);
+        uvret = uv_tcp_init(config.uvloop, &c->uv_tcp_strm);
+        if (uvret == 0) {
+            c->uv_tcp_strm.data = c;
+            c->uv_strm = (uv_stream_t *)&c->uv_tcp_strm;
+            uvret = uv_tcp_connect(&c->connect_req, &c->uv_tcp_strm, addr, connectCb);
+        }
+    } else {
+        uvret = uv_pipe_init(config.uvloop, &c->uv_pipe_strm, 0);
+        if (uvret == 0) {
+            c->uv_pipe_strm.data = c;
+            c->uv_strm = (uv_stream_t *)&c->uv_pipe_strm;
+            uv_pipe_connect(&c->connect_req, &c->uv_pipe_strm, config.hostsocket, connectCb);
+        }
+    }
+    if (uvret != 0) {
+        uv_err_t err = uv_last_error(config.uvloop);
+        errno = err.sys_errno_;
+        fprintf(stderr,"Could not connect to Redis using Libuv at ");
+        if (config.hostsocket == NULL)
+            fprintf(stderr,"%s:%d: %s\n",config.hostip,config.hostport,strerror(errno));
+        else
+            fprintf(stderr,"%s: %s\n",config.hostsocket,strerror(errno));
+        exit(1);
+    }
+
+    /* get context using our own connection */
+    c->context = redisConnectedNonBlock();
+}
+#endif
+
 static client createClient(const char *cmd, size_t len) {
     client c = zmalloc(sizeof(struct _client));
+#ifdef LIBUV
+    connectUv(c);
+#else
     if (config.hostsocket == NULL) {
         c->context = redisConnectNonBlock(config.hostip,config.hostport);
     } else {
@@ -249,6 +415,7 @@ static client createClient(const char *cmd, size_t len) {
             fprintf(stderr,"%s: %s\n",config.hostsocket,c->context->errstr);
         exit(1);
     }
+#endif
     c->obuf = sdsnewlen(cmd,len);
     c->randlen = 0;
     c->written = 0;
@@ -266,7 +433,9 @@ static client createClient(const char *cmd, size_t len) {
     }
 
     redisSetReplyObjectFunctions(c->context,NULL);
+#ifndef LIBUV
     aeCreateFileEvent(config.el,c->context->fd,AE_WRITABLE,writeHandler,c);
+#endif
     listAddNodeTail(config.clients,c);
     config.liveclients++;
     return c;
@@ -321,6 +490,9 @@ static void showLatencyReport(void) {
 static void benchmark(const char *title, const char *cmd, int len) {
     client c;
 
+#ifdef LIBUV
+    config.uvloop = uv_default_loop();
+#endif
     config.title = title;
     config.requests_issued = 0;
     config.requests_finished = 0;
@@ -329,7 +501,11 @@ static void benchmark(const char *title, const char *cmd, int len) {
     createMissingClients(c);
 
     config.start = mstime();
+#ifdef LIBUV
+    uv_run(config.uvloop);
+#else
     aeMain(config.el);
+#endif
     config.totlatency = mstime()-config.start;
 
     showLatencyReport();
@@ -420,12 +596,14 @@ usage:
 }
 
 int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    float dt;
+    float rps;
     REDIS_NOTUSED(eventLoop);
     REDIS_NOTUSED(id);
     REDIS_NOTUSED(clientData);
 
-    float dt = (float)(mstime()-config.start)/1000.0;
-    float rps = (float)config.requests_finished/dt;
+    dt = (float)(mstime()-config.start)/1000.0;
+    rps = (float)config.requests_finished/dt;
     printf("%s: %.2f\r", config.title, rps);
     fflush(stdout);
     return 250; /* every 250ms */
@@ -463,7 +641,7 @@ int main(int argc, const char **argv) {
     argc -= i;
     argv += i;
 
-    config.latency = zmalloc(sizeof(long long)*config.requests);
+    config.latency = (long long *)zmalloc(sizeof(long long)*config.requests);
 
     if (config.keepalive == 0) {
         printf("WARNING: keepalive disabled, you probably need 'echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse' for Linux and 'sudo sysctl -w net.inet.tcp.msl=1000' for Mac OS X in order to use a lot of clients/requests\n");
@@ -496,7 +674,8 @@ int main(int argc, const char **argv) {
 
     /* Run default benchmark suite. */
     do {
-        data = zmalloc(config.datasize+1);
+        const char *argv[21];
+        data = (char*)zmalloc(config.datasize+1);
         memset(data,'x',config.datasize);
         data[config.datasize] = '\0';
 
@@ -506,7 +685,6 @@ int main(int argc, const char **argv) {
         benchmark("PING",cmd,len);
         free(cmd);
 
-        const char *argv[21];
         argv[0] = "MSET";
         for (i = 1; i < 21; i += 2) {
             argv[i] = "foo:rand:000000000000";

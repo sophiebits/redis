@@ -31,10 +31,18 @@
  */
 
 #include <stdio.h>
+#ifdef _WIN32
+#include <sys/types.h>
+#else
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 #include <stdlib.h>
+
+#ifdef _WIN32
+#include "redis.h"
+#endif
 
 #include "ae.h"
 #include "zmalloc.h"
@@ -48,7 +56,11 @@
     #ifdef HAVE_KQUEUE
     #include "ae_kqueue.c"
     #else
-    #include "ae_select.c"
+    #ifdef _WIN32
+        #include "ae_ws2.c"
+    #else
+        #include "ae_select.c"
+    #endif
     #endif
 #endif
 
@@ -86,8 +98,9 @@ void aeStop(aeEventLoop *eventLoop) {
 int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData)
 {
+    aeFileEvent *fe;
     if (fd >= AE_SETSIZE) return AE_ERR;
-    aeFileEvent *fe = &eventLoop->events[fd];
+    fe = &eventLoop->events[fd];
 
     if (aeApiAddEvent(eventLoop, fd, mask) == -1)
         return AE_ERR;
@@ -102,8 +115,9 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
 
 void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask)
 {
+    aeFileEvent *fe;
     if (fd >= AE_SETSIZE) return;
-    aeFileEvent *fe = &eventLoop->events[fd];
+    fe = &eventLoop->events[fd];
 
     if (fe->mask == AE_NONE) return;
     fe->mask = fe->mask & (~mask);
@@ -228,8 +242,11 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
         if (now_sec > te->when_sec ||
             (now_sec == te->when_sec && now_ms >= te->when_ms))
         {
+#ifdef _WIN32
+            long long retval;
+#else
             int retval;
-
+#endif
             id = te->id;
             retval = te->timeProc(eventLoop, id, te->clientData);
             processed++;
@@ -361,8 +378,13 @@ int aeWait(int fd, int mask, long long milliseconds) {
     FD_ZERO(&wfds);
     FD_ZERO(&efds);
 
+#ifdef _WIN32
+    if (mask & AE_READABLE) FD_SET((SOCKET) fd,&rfds);
+    if (mask & AE_WRITABLE) FD_SET((SOCKET) fd,&wfds);
+#else
     if (mask & AE_READABLE) FD_SET(fd,&rfds);
     if (mask & AE_WRITABLE) FD_SET(fd,&wfds);
+#endif
     if ((retval = select(fd+1, &rfds, &wfds, &efds, &tv)) > 0) {
         if (FD_ISSET(fd,&rfds)) retmask |= AE_READABLE;
         if (FD_ISSET(fd,&wfds)) retmask |= AE_WRITABLE;

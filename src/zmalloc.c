@@ -34,6 +34,9 @@
 #include <pthread.h>
 #include "config.h"
 #include "zmalloc.h"
+#ifdef _WIN32
+#include "win32fixes.h"
+#endif
 
 #ifdef HAVE_MALLOC_SIZE
 #define PREFIX_SIZE (0)
@@ -87,8 +90,13 @@ static int zmalloc_thread_safe = 0;
 pthread_mutex_t used_memory_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void zmalloc_oom(size_t size) {
+#ifdef _WIN32
+    fprintf(stderr, "zmalloc: Out of memory trying to allocate %llu bytes\n",
+        (unsigned long long)size);
+#else
     fprintf(stderr, "zmalloc: Out of memory trying to allocate %zu bytes\n",
         size);
+#endif
     fflush(stderr);
     abort();
 }

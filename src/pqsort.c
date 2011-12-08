@@ -42,12 +42,17 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#define inline __inline
+#endif
 
 static inline char	*med3 (char *, char *, char *,
     int (*)(const void *, const void *));
 static inline void	 swapfunc (char *, char *, size_t, int);
 
+#ifndef _WIN32
 #define min(a, b)	(a) < (b) ? a : b
+#endif
 
 /*
  * Qsort routine from Bentley & McIlroy's "Engineering a Sort Function".

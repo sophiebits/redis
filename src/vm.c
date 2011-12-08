@@ -26,6 +26,28 @@
  * as a fully non-blocking VM.
  */
 
+#ifdef LIBUV
+void vmThreadedIOCompletedCallback(uv_async_t* handle, int status);
+#endif
+
+#ifdef PTW32_VERSION
+/* pthread_t is a struct, not an int */
+inline long ThreadSelfID() {
+    pthread_t t = pthread_self();
+    return (long) t.p;
+}
+inline void SetThreadNotUsed(pthread_t *t) {
+    t->p = NULL;
+}
+#else
+inline long ThreadSelfID() {
+    return (long) pthread_self();
+}
+inline void SetThreadNotUsed(pthread_t *t) {
+    *t = (pthread_t) -1;
+}
+#endif
+
 /* =================== Virtual Memory - Blocking Side  ====================== */
 
 /* Create a VM pointer object. This kind of objects are used in place of
@@ -41,9 +63,13 @@ vmpointer *createVmPointer(robj *o) {
 
 void vmInit(void) {
     off_t totsize;
+#ifndef LIBUV
     int pipefds[2];
+#endif
     size_t stacksize;
+#ifndef _WIN32
     struct flock fl;
+#endif
 
     if (server.vm_max_threads != 0)
         zmalloc_enable_thread_safeness(); /* we need thread safe zmalloc() */
@@ -62,6 +88,15 @@ void vmInit(void) {
     server.vm_fd = fileno(server.vm_fp);
     /* Lock the swap file for writing, this is useful in order to avoid
      * another instance to use the same swap file for a config error. */
+#ifdef _WIN32
+
+    if(!LockFile((HANDLE) _get_osfhandle(server.vm_fd), (0x40000001), 0, 1, 0) ) {
+        redisLog(REDIS_WARNING,
+            "Can't lock the swap file at '%s': %s. Make sure it is not used by another Redis instance.", server.vm_swap_file, strerror(errno));
+        WSACleanup();
+        exit(1);
+    }
+#else
     fl.l_type = F_WRLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start = fl.l_len = 0;
@@ -70,6 +105,7 @@ void vmInit(void) {
             "Can't lock the swap file at '%s': %s. Make sure it is not used by another Redis instance.", server.vm_swap_file, strerror(errno));
         exit(1);
     }
+#endif
     /* Initialize */
     server.vm_next_page = 0;
     server.vm_near_pages = 0;
@@ -78,7 +114,11 @@ void vmInit(void) {
     server.vm_stats_swapouts = 0;
     server.vm_stats_swapins = 0;
     totsize = server.vm_pages*server.vm_page_size;
+#ifdef _WIN32
+    redisLog(REDIS_NOTICE,"Allocating %lld bytes of swap file",(long long) totsize);
+#else
     redisLog(REDIS_NOTICE,"Allocating %lld bytes of swap file",totsize);
+#endif
     if (ftruncate(server.vm_fd,totsize) == -1) {
         redisLog(REDIS_WARNING,"Can't ftruncate swap file: %s. Exiting.",
             strerror(errno));
@@ -95,9 +135,15 @@ void vmInit(void) {
     server.io_processing = listCreate();
     server.io_processed = listCreate();
     server.io_ready_clients = listCreate();
+#ifndef _WIN32
+    /* moved to InitSharedObjecsts since they are first time used there */
     pthread_mutex_init(&server.io_mutex,NULL);
     pthread_mutex_init(&server.io_swapfile_mutex,NULL);
+#endif
     server.io_active_threads = 0;
+#ifdef LIBUV
+    uv_async_init(server.uvloop, &server.io_ready_async_handle, vmThreadedIOCompletedCallback);
+#else
     if (pipe(pipefds) == -1) {
         redisLog(REDIS_WARNING,"Unable to intialized VM: pipe(2): %s. Exiting."
             ,strerror(errno));
@@ -106,6 +152,7 @@ void vmInit(void) {
     server.io_ready_pipe_read = pipefds[0];
     server.io_ready_pipe_write = pipefds[1];
     redisAssert(anetNonBlock(NULL,server.io_ready_pipe_read) != ANET_ERR);
+#endif
     /* LZF requires a lot of stack */
     pthread_attr_init(&server.io_threads_attr);
     pthread_attr_getstacksize(&server.io_threads_attr, &stacksize);
@@ -116,10 +163,12 @@ void vmInit(void) {
 
     while (stacksize < REDIS_THREAD_STACK_SIZE) stacksize *= 2;
     pthread_attr_setstacksize(&server.io_threads_attr, stacksize);
+#ifndef LIBUV
     /* Listen for events in the threaded I/O pipe */
     if (aeCreateFileEvent(server.el, server.io_ready_pipe_read, AE_READABLE,
         vmThreadedIOCompletedJob, NULL) == AE_ERR)
         oom("creating file event");
+#endif
 }
 
 /* Mark the page as used */
@@ -250,7 +299,17 @@ int vmWriteObjectOnSwap(robj *o, off_t page) {
             strerror(errno));
         return REDIS_ERR;
     }
+#ifdef _WIN32
+    if (rdbSaveObject(server.vm_fp,o) == -1) {
+        if (server.vm_enabled) pthread_mutex_unlock(&server.io_swapfile_mutex);
+        redisLog(REDIS_WARNING,
+            "Critical VM problem in rdbWriteObjectOnSwap failed saving object: %s",
+            strerror(errno));
+        return REDIS_ERR;
+    }
+#else
     rdbSaveObject(server.vm_fp,o);
+#endif
     fflush(server.vm_fp);
     if (server.vm_enabled) pthread_mutex_unlock(&server.io_swapfile_mutex);
     return REDIS_OK;
@@ -560,6 +619,28 @@ void freeIOJob(iojob *j) {
     zfree(j);
 }
 
+#ifdef LIBUV
+/* Every time a thread finished a Job, it calls Uv_async_send to invoke 
+ * this method on the main thread.
+ *
+ * Note that this is called both by the event loop, and  from
+ * waitEmptyIOJobsQueue().
+ *
+ * We don't know how many threads completed, so we loop if
+ * server.io_processed is not empty.
+ *
+ * In the latter case we don't want to swap more, so we use the
+ * trytoswap argument setting it to a 0 value to signal this
+ * condition. */
+void vmThreadedIOCompletedJobHandler(int trytoswap)
+{
+    int retval = 0;
+    int processed = 0;
+    int toprocess = -1;
+
+    while (1) {
+
+#else
 /* Every time a thread finished a Job, it writes a byte into the write side
  * of an unix pipe in order to "awake" the main thread, and this function
  * is called.
@@ -585,6 +666,7 @@ void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata,
     /* For every byte we read in the read side of the pipe, there is one
      * I/O job completed to process. */
     while((retval = read(fd,buf,1)) == 1) {
+#endif
         iojob *j;
         listNode *ln;
         struct dictEntry *de;
@@ -593,7 +675,15 @@ void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata,
 
         /* Get the processed element (the oldest one) */
         lockThreadedIO();
+#ifdef LIBUV
+        /* if list is empty, break out of loop */
+        if (listLength(server.io_processed) == 0) {
+            unlockThreadedIO();
+            break;
+        }
+#else
         redisAssert(listLength(server.io_processed) != 0);
+#endif
         if (toprocess == -1) {
             toprocess = (listLength(server.io_processed)*REDIS_MAX_COMPLETED_JOBS_PROCESSED)/100;
             if (toprocess <= 0) toprocess = 1;
@@ -698,6 +788,12 @@ void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata,
             }
         }
         processed++;
+#ifdef LIBUV
+        /* We need to make sure the Libuv event loop will call us again if there is more work to do */
+        if (processed == toprocess && listLength(server.io_processed) > 0) {
+            uv_async_send(&server.io_ready_async_handle);
+        }
+#endif
         if (processed == toprocess) return;
     }
     if (retval < 0 && errno != EAGAIN) {
@@ -706,6 +802,17 @@ void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata,
             strerror(errno));
     }
 }
+
+#ifdef LIBUV
+/* callback for Libuv uv_async_send runs on main loop
+ *  call handler, passing 1 for trytoswap */
+void vmThreadedIOCompletedCallback(uv_async_t* handle, int status) {
+    REDIS_NOTUSED(status);
+    REDIS_NOTUSED(handle);
+    
+    vmThreadedIOCompletedJobHandler(1);
+}
+#endif
 
 void lockThreadedIO(void) {
     pthread_mutex_lock(&server.io_mutex);
@@ -803,6 +910,12 @@ void *IOThreadEntryPoint(void *arg) {
     listNode *ln;
     REDIS_NOTUSED(arg);
 
+#ifdef _WIN32
+    /* using pthreads as statically linked library
+       requires initialization */
+    pthread_win32_thread_attach_np();
+#endif
+
     pthread_detach(pthread_self());
     while(1) {
         /* Get a new job to process */
@@ -810,9 +923,14 @@ void *IOThreadEntryPoint(void *arg) {
         if (listLength(server.io_newjobs) == 0) {
             /* No new jobs in queue, exit. */
             redisLog(REDIS_DEBUG,"Thread %ld exiting, nothing to do",
-                (long) pthread_self());
+                ThreadSelfID());
             server.io_active_threads--;
             unlockThreadedIO();
+#ifdef _WIN32
+            /* using pthreads as statically linked library
+               requires cleanup */
+            pthread_win32_thread_detach_np ();
+#endif
             return NULL;
         }
         ln = listFirst(server.io_newjobs);
@@ -824,7 +942,7 @@ void *IOThreadEntryPoint(void *arg) {
         ln = listLast(server.io_processing); /* We use ln later to remove it */
         unlockThreadedIO();
         redisLog(REDIS_DEBUG,"Thread %ld got a new job (type %d): %p about key '%s'",
-            (long) pthread_self(), j->type, (void*)j, (char*)j->key->ptr);
+            ThreadSelfID(), j->type, (void*)j, (char*)j->key->ptr);
 
         /* Process the Job */
         if (j->type == REDIS_IOJOB_LOAD) {
@@ -839,14 +957,19 @@ void *IOThreadEntryPoint(void *arg) {
 
         /* Done: insert the job into the processed queue */
         redisLog(REDIS_DEBUG,"Thread %ld completed the job: %p (key %s)",
-            (long) pthread_self(), (void*)j, (char*)j->key->ptr);
+            ThreadSelfID(), (void*)j, (char*)j->key->ptr);
         lockThreadedIO();
         listDelNode(server.io_processing,ln);
         listAddNodeTail(server.io_processed,j);
         unlockThreadedIO();
 
+#ifdef LIBUV
+        /* Signal the main thread there is new stuff to process */
+        uv_async_send(&server.io_ready_async_handle);
+#else
         /* Signal the main thread there is new stuff to process */
         redisAssert(write(server.io_ready_pipe_write,"x",1) == 1);
+#endif
     }
     return NULL; /* never reached */
 }
@@ -891,8 +1014,12 @@ void waitEmptyIOJobsQueue(void) {
         io_processed_len = listLength(server.io_processed);
         unlockThreadedIO();
         if (io_processed_len) {
+#ifdef LIBUV
+            vmThreadedIOCompletedJobHandler(0);
+#else
             vmThreadedIOCompletedJob(NULL,server.io_ready_pipe_read,
                                                         (void*)0xdeadbeef,0);
+#endif
             usleep(1000); /* 1 millisecond */
         } else {
             usleep(10000); /* 10 milliseconds */
@@ -932,7 +1059,7 @@ int vmSwapObjectThreaded(robj *key, robj *val, redisDb *db) {
     j->id = j->val = val;
     incrRefCount(val);
     j->canceled = 0;
-    j->thread = (pthread_t) -1;
+    SetThreadNotUsed(&j->thread);
     val->storage = REDIS_VM_SWAPPING;
 
     lockThreadedIO();
@@ -1003,7 +1130,7 @@ int waitForSwappedKey(redisClient *c, robj *key) {
         j->page = vp->page;
         j->val = NULL;
         j->canceled = 0;
-        j->thread = (pthread_t) -1;
+        SetThreadNotUsed(&j->thread);
         lockThreadedIO();
         queueIOJob(j);
         unlockThreadedIO();
@@ -1084,7 +1211,11 @@ int blockClientOnSwappedKeys(redisClient *c) {
     /* If the client was blocked for at least one key, mark it as blocked. */
     if (listLength(c->io_keys)) {
         c->flags |= REDIS_IO_WAIT;
+#ifdef LIBUV
+        uv_read_stop(c->stream);
+#else
         aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
+#endif
         server.vm_blocked_clients++;
         return 1;
     } else {
@@ -1147,8 +1278,9 @@ void handleClientsBlockedOnSwappedKey(redisDb *db, robj *key) {
     /* Note: we can't use something like while(listLength(l)) as the list
      * can be freed by the calling function when we remove the last element. */
     while (len--) {
+        redisClient *c;
         ln = listFirst(l);
-        redisClient *c = ln->value;
+        c = (redisClient *)ln->value;
 
         if (dontWaitForSwappedKey(c,key)) {
             /* Put the client in the list of clients ready to go as we

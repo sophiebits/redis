@@ -201,7 +201,11 @@ static unsigned int zipmapRawEntryLength(unsigned char *p) {
     return l + zipmapRawValueLength(p+l);
 }
 
+#ifdef _WIN32
+static __inline unsigned char *zipmapResize(unsigned char *zm, unsigned int len) {
+#else
 static inline unsigned char *zipmapResize(unsigned char *zm, unsigned int len) {
+#endif
     zm = zrealloc(zm, len);
     zm[len-1] = ZIPMAP_END;
     return zm;

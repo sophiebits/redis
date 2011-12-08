@@ -33,7 +33,13 @@
 #define __HIREDIS_H
 #include <stdio.h> /* for size_t */
 #include <stdarg.h> /* for va_list */
+#ifndef _WIN32
 #include <sys/time.h> /* for struct timeval */
+#endif
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#endif
 
 #define HIREDIS_MAJOR 0
 #define HIREDIS_MINOR 9
@@ -117,7 +123,11 @@ struct redisContext; /* need forward declaration of redisContext */
 
 /* Context for a connection to Redis */
 typedef struct redisContext {
+#ifdef _WIN32
+    SOCKET fd;
+#else
     int fd;
+#endif
     int flags;
     char *obuf; /* Write buffer */
     int err; /* Error flags, 0 when there is no error */
@@ -149,10 +159,13 @@ redisContext *redisConnectNonBlock(const char *ip, int port);
 redisContext *redisConnectUnix(const char *path);
 redisContext *redisConnectUnixWithTimeout(const char *path, struct timeval tv);
 redisContext *redisConnectUnixNonBlock(const char *path);
+redisContext *redisConnected();
+redisContext *redisConnectedNonBlock();
 int redisSetTimeout(redisContext *c, struct timeval tv);
 int redisSetReplyObjectFunctions(redisContext *c, redisReplyObjectFunctions *fn);
 void redisFree(redisContext *c);
 int redisBufferRead(redisContext *c);
+int redisBufferReadDone(redisContext *c, char *buf, int nread);
 int redisBufferWrite(redisContext *c, int *done);
 
 /* In a blocking context, this function first checks if there are unconsumed

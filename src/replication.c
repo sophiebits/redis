@@ -1,7 +1,9 @@
 #include "redis.h"
 
+#ifndef _WIN32
 #include <sys/time.h>
 #include <unistd.h>
+#endif
 #include <fcntl.h>
 #include <sys/stat.h>
 
@@ -146,15 +148,133 @@ void syncCommand(redisClient *c) {
     c->flags |= REDIS_SLAVE;
     c->slaveseldb = 0;
     listAddNodeTail(server.slaves,c);
+#ifdef _WIN32
+    /* Since WIN32 won't fork(),  but instead do Save() we must manualy call this */
+    updateSlavesWaitingBgsave(REDIS_OK);
+#endif
     return;
 }
 
+#ifdef LIBUV
+void sendBulkToSlave(redisClient *slave, int status);
+
+/* This is a write callback function. */
+static void after_writeCount(uv_write_t* req, int status) {
+    /* Free the read/write buffer and the request */
+    redisClient *cli;
+    writeclientData * wrData;
+    REDIS_NOTUSED(status);
+    wrData = req->data;
+    cli = wrData->cli;
+
+    sdsfree(wrData->bufs[0].base);
+    zfree(wrData);
+}
+
+static void after_writeBulk(uv_write_t* req, int status) {
+    /* Free the read/write buffer and the request */
+    redisClient *slave;
+    writeclientData * wrData;
+    wrData = req->data;
+    slave = wrData->cli;
+ 
+    zfree(wrData->bufs[0].base);
+    zfree(wrData);
+
+    if (status == 0) {
+        if (slave->repldboff == slave->repldbsize) {
+            /* all data sent */
+            close(slave->repldbfd);
+            slave->repldbfd = -1;
+
+            slave->replstate = REDIS_REPL_ONLINE;
+            addReplySds(slave,sdsempty());
+            redisLog(REDIS_NOTICE,"Synchronization with slave succeeded");
+        } else {
+            /* continue sending */
+            sendBulkToSlave(slave, status);
+        }
+    }
+}
+
+/* write to TCP using Libuv */
+int doWrite(redisClient *slave, char *buf, ssize_t buflen, uv_write_cb cb) {
+    writeclientData * wrData = NULL;
+    uv_write_t *wr = NULL;
+    int status = 0;
+
+    wrData = (writeclientData*)zmalloc(sizeof(writeclientData));
+    wr = &(wrData->wr);
+    wr->data = wrData;
+    wrData->bufs[0] = uv_buf_init(buf, buflen);
+    wrData->cli = slave;
+
+    status = uv_write(wr, slave->stream, wrData->bufs, 1, cb);
+    if (status != 0) {
+        uv_err_t err = uv_last_error(server.uvloop);
+        errno = err.sys_errno_;
+        zfree(wrData);
+    }
+    return status;
+}
+
+/* This is called to start the writes, and from the callback to continue writing */
+void sendBulkToSlave(redisClient *slave, int status) {
+    char *buf;
+    ssize_t buflen;
+
+    if (status != 0) {
+        uv_err_t err = uv_last_error(server.uvloop);
+        errno = err.sys_errno_;
+        redisLog(REDIS_VERBOSE,"Write error sending DB to slave: %s",
+            strerror(errno));
+        freeClient(slave);
+        return;
+    }
+
+    if (slave->repldboff == 0) {
+        sds bulkcount;
+
+        bulkcount = sdscatprintf(sdsempty(),"$%lld\r\n",(unsigned long long)
+            slave->repldbsize);
+        
+        if (doWrite(slave, bulkcount, (ssize_t)sdslen(bulkcount), after_writeCount) != 0) {
+            freeClient(slave);
+            return;
+        }
+    }
+    while (slave->repldboff < slave->repldbsize) {
+        lseek(slave->repldbfd,slave->repldboff,SEEK_SET);
+        buf = zmalloc(REDIS_IOBUF_LEN);
+
+        buflen = read(slave->repldbfd,buf,REDIS_IOBUF_LEN);
+        if (buflen <= 0) {
+            redisLog(REDIS_WARNING,"Read error sending DB to slave: %s",
+                (buflen == 0) ? "premature EOF" : strerror(errno));
+            freeClient(slave);
+            return;
+        }
+
+        if (doWrite(slave, buf, buflen, after_writeBulk) != 0) {
+            if (errno != EAGAIN) {
+                redisLog(REDIS_WARNING,"Write error sending DB to slave: %s",
+                    strerror(errno));
+                freeClient(slave);
+            }
+            return;
+        }
+
+        /* mark the bytes written, even though they are only buffered. */
+        slave->repldboff += buflen;
+    }
+}
+#else
 void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
-    redisClient *slave = privdata;
-    REDIS_NOTUSED(el);
-    REDIS_NOTUSED(mask);
+    redisClient *slave = (redisClient *)privdata;
     char buf[REDIS_IOBUF_LEN];
     ssize_t nwritten, buflen;
+    REDIS_NOTUSED(el);
+    REDIS_NOTUSED(mask);
 
     if (slave->repldboff == 0) {
         /* Write the bulk write count before to transfer the DB. In theory here
@@ -202,6 +322,7 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         redisLog(REDIS_NOTICE,"Synchronization with slave succeeded");
     }
 }
+#endif
 
 /* This function is called at the end of every backgrond saving.
  * The argument bgsaveerr is REDIS_OK if the background saving succeeded
@@ -229,8 +350,13 @@ void updateSlavesWaitingBgsave(int bgsaveerr) {
                 redisLog(REDIS_WARNING,"SYNC failed. BGSAVE child returned an error");
                 continue;
             }
+#ifdef _WIN32
+            if ((slave->repldbfd = open(server.dbfilename,O_RDONLY|_O_BINARY)) == -1 ||
+                redis_fstat(slave->repldbfd,&buf) == -1) {
+#else
             if ((slave->repldbfd = open(server.dbfilename,O_RDONLY)) == -1 ||
                 redis_fstat(slave->repldbfd,&buf) == -1) {
+#endif
                 freeClient(slave);
                 redisLog(REDIS_WARNING,"SYNC failed. Can't open/stat DB after BGSAVE: %s", strerror(errno));
                 continue;
@@ -238,11 +364,16 @@ void updateSlavesWaitingBgsave(int bgsaveerr) {
             slave->repldboff = 0;
             slave->repldbsize = buf.st_size;
             slave->replstate = REDIS_REPL_SEND_BULK;
+#ifdef LIBUV
+            /* with LIBUV, do not wait for ready event, just start writing. */
+            sendBulkToSlave(slave, 0);
+#else
             aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
             if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendBulkToSlave, slave) == AE_ERR) {
                 freeClient(slave);
                 continue;
             }
+#endif
         }
     }
     if (startbgsave) {
@@ -263,6 +394,290 @@ void updateSlavesWaitingBgsave(int bgsaveerr) {
 
 /* ----------------------------------- SLAVE -------------------------------- */
 
+#ifdef LIBUV
+void replicationClose(uv_handle_t* handle) {
+    redisLog(REDIS_WARNING, "replication close callback:");
+    zfree(handle);
+}
+
+/* Abort the async download of the bulk dataset while SYNC-ing with master */
+void replicationAbortSyncTransfer(void) {
+    redisAssert(server.replstate == REDIS_REPL_TRANSFER);
+    redisLog(REDIS_VERBOSE, "replicationAbortSyncTransfer closing");
+
+    uv_read_stop((uv_stream_t*)server.uv_tcp_repl_transfer_s);
+    uv_close((uv_handle_t*)server.uv_tcp_repl_transfer_s, replicationClose);
+    close(server.repl_transfer_fd);
+    unlink(server.repl_transfer_tmpfile);
+    zfree(server.repl_transfer_tmpfile);
+    server.replstate = REDIS_REPL_CONNECT;
+}
+
+static uv_buf_t readbuf_alloc(uv_handle_t* handle, size_t suggested_size) {
+    REDIS_NOTUSED(handle);
+    return uv_buf_init(zmalloc(suggested_size), suggested_size);
+}
+
+void readBulkPayloadComplete(int loadrc, void *cdata) {
+    REDIS_NOTUSED(cdata);
+    if (loadrc != REDIS_OK) {
+        redisLog(REDIS_WARNING,"Failed trying to load the MASTER synchronization DB from disk");
+        replicationAbortSyncTransfer();
+        return;
+    }
+    server.master = createClient((uv_stream_t *)server.uv_tcp_repl_transfer_s);
+    server.master->flags |= REDIS_MASTER;
+    server.master->authenticated = 1;
+    server.replstate = REDIS_REPL_CONNECTED;
+    redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Finished with success");
+    /* Rewrite the AOF file now that the dataset changed. */
+    if (server.appendonly) rewriteAppendOnlyFileBackground();
+}
+
+/* Asynchronously read the SYNC payload we receive from a master */
+void readSyncBulkPayload(uv_stream_t* stream, ssize_t nread, uv_buf_t uvbuf) {
+    char *buf;
+    char* pos;
+    ssize_t readlen;
+
+    if (nread < 0)  {
+        uv_err_t err = uv_last_error(server.uvloop);
+        errno = err.sys_errno_;
+        redisLog(REDIS_WARNING,
+            "I/O error reading bulk count from MASTER: %s",
+            strerror(errno));
+
+        goto error;
+    } 
+
+    buf = uvbuf.base;
+    pos = buf;
+    /* If repl_transfer_left == -1 we still have to read the bulk length
+     * from the master reply. */
+    if (server.repl_transfer_left == -1) {
+        /* TODO: if no newline, buffer and wait for more data */
+        int foundnl = 0;
+        while (nread > 0 && foundnl == 0) {
+            if (*pos == '\n') {
+                *pos = '\0';
+                if (pos - buf > 0) {
+                    if (*(pos-1) == '\r') *(pos-1) = '\0';
+                }
+                foundnl = 1;
+            }
+            pos++;
+            nread--;
+        }
+        if (foundnl != 1) {
+            redisLog(REDIS_WARNING,
+                "I/O error reading bulk count from MASTER: %s",
+                strerror(ETIMEDOUT));
+            goto error;
+        }
+
+        if (buf[0] == '-') {
+            redisLog(REDIS_WARNING,
+                "MASTER aborted replication with an error: %s",
+                buf+1);
+            goto error;
+        } else if (buf[0] == '\0') {
+            /* At this stage just a newline works as a PING in order to take
+             * the connection live. So we refresh our last interaction
+             * timestamp. */
+            server.repl_transfer_lastio = time(NULL);
+            return;
+        } else if (buf[0] != '$') {
+            redisLog(REDIS_WARNING,"Bad protocol from MASTER, the first byte is not '$', are you sure the host and port are right?");
+            goto error;
+        }
+        server.repl_transfer_left = strtol(buf+1,NULL,10);
+        redisLog(REDIS_NOTICE,
+            "MASTER <-> SLAVE sync: receiving %ld bytes from master",
+            server.repl_transfer_left);
+        buf = pos;
+    }
+
+    /* continue processing data in buffer */
+
+    /* Read bulk data */
+    readlen = (server.repl_transfer_left < nread) ?
+        server.repl_transfer_left : nread;
+
+    server.repl_transfer_lastio = time(NULL);
+
+    if (write(server.repl_transfer_fd, buf, readlen) != readlen) {
+        redisLog(REDIS_WARNING,"Write error or short write writing to the DB dump file needed for MASTER <-> SLAVE synchrnonization: %s", strerror(errno));
+        goto error;
+    }
+    server.repl_transfer_left -= readlen;
+    /* Check if the transfer is now complete */
+    if (server.repl_transfer_left == 0) {
+#ifdef _WIN32
+        /* Close temp, since rename is unable to delete open file */
+        close(server.repl_transfer_fd);
+#endif
+        if (rename(server.repl_transfer_tmpfile,server.dbfilename) == -1) {
+            redisLog(REDIS_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
+            goto error;
+        }
+
+        redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Loading DB in memory");
+        emptyDb();
+        /* Before loading the DB into memory we need to stop read events
+         * otherwise it will get called recursively since
+         * rdbLoad() will run the event loop to process events from time to
+         * time for non blocking loading. */
+        uv_read_stop(stream);
+        if (rdbLoadStart(server.dbfilename, readBulkPayloadComplete, NULL) != REDIS_OK) {
+            redisLog(REDIS_WARNING,"Failed trying to load the MASTER synchronization DB from disk");
+            goto error;
+        }
+
+        /* Final setup of the connected slave <- master link */
+        zfree(server.repl_transfer_tmpfile);
+#ifndef _WIN32
+        /* Moved before rename tmp->db in windows */
+        close(server.repl_transfer_fd);
+#endif
+    }
+
+    if (uvbuf.base) {
+        zfree(uvbuf.base);
+    }
+    return;
+
+error:
+    if (uvbuf.base) {
+        zfree(uvbuf.base);
+    }
+    replicationAbortSyncTransfer();
+    return;
+}
+
+void syncWithMaster(uv_connect_t* req, int status) {
+    char buf[1024], tmpfile[256];
+    int dfd, maxtries = 5;
+    int fd;
+
+    if (status != 0) {
+        uv_err_t err = uv_last_error(server.uvloop);
+        errno = err.sys_errno_;
+        redisLog(REDIS_WARNING,"Unable to connect to MASTER: %s",
+                strerror(errno));
+        goto error;
+    }
+    redisLog(REDIS_NOTICE,"Non blocking connect for SYNC fired the event.");
+
+    uv_tcp_getsocket(server.uv_tcp_repl_transfer_s, &fd);
+    if (fd == -1) {
+        redisLog(REDIS_WARNING,"TCP socket not valid");
+        goto error;
+    }
+
+    /* If this event fired after the user turned the instance into a master
+     * with SLAVEOF NO ONE we must just return ASAP. */
+    if (server.replstate == REDIS_REPL_NONE) {
+        uv_close((uv_handle_t *)server.uv_tcp_repl_transfer_s, replicationClose);
+        return;
+    }
+
+    /* AUTH with the master if required. */
+    if(server.masterauth) {
+        char authcmd[1024];
+        size_t authlen;
+
+        authlen = snprintf(authcmd,sizeof(authcmd),"AUTH %s\r\n",server.masterauth);
+        if (syncWrite(fd,
+                        authcmd,authlen,server.repl_syncio_timeout) == -1) {
+            redisLog(REDIS_WARNING,"Unable to AUTH to MASTER: %s",
+                strerror(errno));
+            goto error;
+        }
+        /* Read the AUTH result.  */
+        if (syncReadLine(fd,
+                        buf,1024,server.repl_syncio_timeout) == -1) {
+            redisLog(REDIS_WARNING,"I/O error reading auth result from MASTER: %s",
+                strerror(errno));
+            goto error;
+        }
+        if (buf[0] != '+') {
+            redisLog(REDIS_WARNING,"Cannot AUTH to MASTER, is the masterauth password correct?");
+            goto error;
+        }
+    }
+
+    /* Issue the SYNC command */
+    if (syncWrite(fd,
+                    "SYNC \r\n",7,server.repl_syncio_timeout) == -1) {
+        redisLog(REDIS_WARNING,"I/O error writing to MASTER: %s",
+            strerror(errno));
+        goto error;
+    }
+
+    /* Prepare a suitable temp file for bulk transfer */
+    while(maxtries--) {
+        snprintf(tmpfile,256,
+            "temp-%d.%ld.rdb",(int)time(NULL),(long int)getpid());
+#ifdef _WIN32
+        dfd = open(tmpfile,O_CREAT|O_WRONLY|O_EXCL|O_BINARY,0644);
+#else
+        dfd = open(tmpfile,O_CREAT|O_WRONLY|O_EXCL,0644);
+#endif
+        if (dfd != -1) break;
+        sleep(1);
+    }
+    if (dfd == -1) {
+        redisLog(REDIS_WARNING,"Opening the temp file needed for MASTER <-> SLAVE synchronization: %s",strerror(errno));
+        goto error;
+    }
+
+    /* start async reading */
+    uv_read_start((uv_stream_t *)server.uv_tcp_repl_transfer_s, readbuf_alloc, readSyncBulkPayload);
+
+    zfree(req);
+
+    /* ready for transfer */
+    server.replstate = REDIS_REPL_TRANSFER;
+    server.repl_transfer_left = -1;
+    server.repl_transfer_fd = dfd;
+    server.repl_transfer_lastio = time(NULL);
+    server.repl_transfer_tmpfile = zstrdup(tmpfile);
+    return;
+
+error:
+    server.replstate = REDIS_REPL_CONNECT;
+    uv_close((uv_handle_t *)server.uv_tcp_repl_transfer_s, replicationClose);
+    zfree(req);
+    
+    return;
+}
+
+int connectWithMaster(void) {
+    uv_connect_t* connect_req = zmalloc(sizeof(uv_connect_t));
+    struct sockaddr_in addr = uv_ip4_addr(server.masterhost, server.masterport);
+
+    server.uv_tcp_repl_transfer_s = (uv_tcp_t *)zmalloc(sizeof(uv_tcp_t));
+    if (uv_tcp_init(server.uvloop, server.uv_tcp_repl_transfer_s) == 0) {
+        if (uv_tcp_connect(connect_req, server.uv_tcp_repl_transfer_s, 
+                        addr, syncWithMaster) != 0) {
+            uv_err_t err = uv_last_error(server.uvloop);
+            errno = err.sys_errno_;
+            redisLog(REDIS_WARNING,"Unable to connect to MASTER: %s",
+                    strerror(errno));
+            return REDIS_ERR;
+        }
+    } else {
+        uv_err_t err = uv_last_error(server.uvloop);
+        errno = err.sys_errno_;
+        redisLog(REDIS_WARNING,"Unable to connect to MASTER: %s",
+                strerror(errno));
+        return REDIS_ERR;
+    }
+
+    server.replstate = REDIS_REPL_CONNECTING;
+    return REDIS_OK;
+}
+#else
 /* Abort the async download of the bulk dataset while SYNC-ing with master */
 void replicationAbortSyncTransfer(void) {
     redisAssert(server.replstate == REDIS_REPL_TRANSFER);
@@ -475,6 +890,7 @@ int connectWithMaster(void) {
     server.replstate = REDIS_REPL_CONNECTING;
     return REDIS_OK;
 }
+#endif
 
 void slaveofCommand(redisClient *c) {
     if (!strcasecmp(c->argv[1]->ptr,"no") &&
@@ -503,6 +919,16 @@ void slaveofCommand(redisClient *c) {
 }
 
 /* --------------------------- REPLICATION CRON  ---------------------------- */
+
+#ifdef LIBUV
+static void after_ping(uv_write_t* req, int status) {
+    REDIS_NOTUSED(status);
+    zfree(req->data);
+}
+#endif
+
+#define REDIS_REPL_TIMEOUT 60
+#define REDIS_REPL_PING_SLAVE_PERIOD 10
 
 void replicationCron(void) {
     /* Bulk transfer I/O timeout? */
@@ -553,9 +979,18 @@ void replicationCron(void) {
                  * connection last interaction time, and at the same time
                  * we'll be sure that being a single char there are no
                  * short-write problems. */
+#ifdef LIBUV
+                writeclientData * wrdata = zmalloc(sizeof(writeclientData));
+                wrdata->bufs[0] = uv_buf_init("\n", 1);
+                wrdata->wr.data = wrdata;
+                if (uv_write(&wrdata->wr, slave->stream, wrdata->bufs, 1, after_ping) != 0) {
+                    /* Don't worry, it's just a ping. */
+                }
+#else
                 if (write(slave->fd, "\n", 1) == -1) {
                     /* Don't worry, it's just a ping. */
                 }
+#endif
             }
         }
     }

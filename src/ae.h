@@ -41,6 +41,9 @@
 #define AE_NONE 0
 #define AE_READABLE 1
 #define AE_WRITABLE 2
+#ifdef _WIN32
+   #define AE_PIPE 16 /* Flag to separate select on pipes and sockets */
+#endif
 
 #define AE_FILE_EVENTS 1
 #define AE_TIME_EVENTS 2

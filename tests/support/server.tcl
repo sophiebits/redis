@@ -49,7 +49,7 @@ proc kill_server config {
         if {[incr wait 10] % 1000 == 0} {
             puts "Waiting for process $pid to exit..."
         }
-        catch {exec kill $pid}
+        kill_proc $config
         after 10
     }
 
@@ -59,12 +59,41 @@ proc kill_server config {
     }
 }
 
-proc is_alive config {
-    set pid [dict get $config pid]
-    if {[catch {exec ps -p $pid} err]} {
-        return 0
-    } else {
-        return 1
+if { $tcl_platform(platform) == "windows" } {
+    proc is_alive config {
+        set pid [dict get $config pid]
+        set mfilter {PID eq }
+        append mfilter $pid
+        if { [string first $pid [exec tasklist.exe -FI ${mfilter}]] != -1 } {
+            return 1
+        } else {
+            return 0
+        }
+    }
+}
+
+if { $tcl_platform(platform) == "windows" } {
+    proc kill_proc config {
+        set pid [dict get $config pid]
+        catch {exec taskkill.exe -F -T -PID $pid}
+    }
+}
+
+if { $tcl_platform(platform) != "windows" } {
+    proc is_alive config {
+        set pid [dict get $config pid]
+        if {[catch {exec ps -p $pid} err]} {
+            return 0
+        } else {
+            return 1
+        }
+    }
+}
+
+if { $tcl_platform(platform) != "windows" } {
+    proc kill_proc config {
+        set pid [dict get $config pid]
+        catch {exec kill $pid}
     }
 }
 

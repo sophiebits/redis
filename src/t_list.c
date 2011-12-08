@@ -379,10 +379,11 @@ void llenCommand(redisClient *c) {
 }
 
 void lindexCommand(redisClient *c) {
+    robj *value = NULL;
+    int index;
     robj *o = lookupKeyReadOrReply(c,c->argv[1],shared.nullbulk);
     if (o == NULL || checkType(c,o,REDIS_LIST)) return;
-    int index = atoi(c->argv[2]->ptr);
-    robj *value = NULL;
+    index = atoi(c->argv[2]->ptr);
 
     if (o->encoding == REDIS_ENCODING_ZIPLIST) {
         unsigned char *p;
@@ -415,10 +416,12 @@ void lindexCommand(redisClient *c) {
 }
 
 void lsetCommand(redisClient *c) {
+    int index;
+    robj *value;
     robj *o = lookupKeyWriteOrReply(c,c->argv[1],shared.nokeyerr);
     if (o == NULL || checkType(c,o,REDIS_LIST)) return;
-    int index = atoi(c->argv[2]->ptr);
-    robj *value = (c->argv[3] = tryObjectEncoding(c->argv[3]));
+    index = atoi(c->argv[2]->ptr);
+    value = (c->argv[3] = tryObjectEncoding(c->argv[3]));
 
     listTypeTryConversion(o,value);
     if (o->encoding == REDIS_ENCODING_ZIPLIST) {
@@ -453,10 +456,11 @@ void lsetCommand(redisClient *c) {
 }
 
 void popGenericCommand(redisClient *c, int where) {
+    robj *value;
     robj *o = lookupKeyWriteOrReply(c,c->argv[1],shared.nullbulk);
     if (o == NULL || checkType(c,o,REDIS_LIST)) return;
 
-    robj *value = listTypePop(o,where);
+    value = listTypePop(o,where);
     if (value == NULL) {
         addReply(c,shared.nullbulk);
     } else {
@@ -590,10 +594,12 @@ void ltrimCommand(redisClient *c) {
 
 void lremCommand(redisClient *c) {
     robj *subject, *obj;
-    obj = c->argv[3] = tryObjectEncoding(c->argv[3]);
-    int toremove = atoi(c->argv[2]->ptr);
+    int toremove;
     int removed = 0;
     listTypeEntry entry;
+    listTypeIterator *li;
+    obj = c->argv[3] = tryObjectEncoding(c->argv[3]);
+    toremove = atoi(c->argv[2]->ptr);
 
     subject = lookupKeyWriteOrReply(c,c->argv[1],shared.czero);
     if (subject == NULL || checkType(c,subject,REDIS_LIST)) return;
@@ -602,7 +608,6 @@ void lremCommand(redisClient *c) {
     if (subject->encoding == REDIS_ENCODING_ZIPLIST)
         obj = getDecodedObject(obj);
 
-    listTypeIterator *li;
     if (toremove < 0) {
         toremove = -toremove;
         li = listTypeInitIterator(subject,-1,REDIS_HEAD);
@@ -971,11 +976,12 @@ void brpopCommand(redisClient *c) {
 
 void brpoplpushCommand(redisClient *c) {
     time_t timeout;
+    robj *key;
 
     if (getTimeoutFromObjectOrReply(c,c->argv[3],&timeout) != REDIS_OK)
         return;
 
-    robj *key = lookupKeyWrite(c->db, c->argv[1]);
+    key = lookupKeyWrite(c->db, c->argv[1]);
 
     if (key == NULL) {
         if (c->flags & REDIS_MULTI) {

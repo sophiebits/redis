@@ -34,11 +34,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <ctype.h>
 #include <errno.h>
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <sys/time.h>
+#endif
 #include <assert.h>
 
 #include "hiredis.h"
@@ -46,6 +50,10 @@
 #include "zmalloc.h"
 #include "linenoise.h"
 #include "help.h"
+#ifdef _WIN32
+#include "win32fixes.h"
+#define strncasecmp(x,y,l) strcmp(x,y)
+#endif
 
 #define REDIS_NOTUSED(V) ((void) V)
 
@@ -82,8 +90,8 @@ static long long mstime(void) {
     long long mst;
 
     gettimeofday(&tv, NULL);
-    mst = ((long)tv.tv_sec)*1000;
-    mst += tv.tv_usec/1000;
+    mst = (long long)((long)tv.tv_sec)*1000;
+    mst += (long long)(tv.tv_usec/1000);
     return mst;
 }
 
@@ -661,10 +669,17 @@ static void repl() {
     if (isatty(fileno(stdin))) {
         history = 1;
 
+#ifdef _WIN32
+        if (getenv("USERPROFILE") != NULL) {
+            historyfile = sdscatprintf(sdsempty(),"%s\\.rediscli_history",getenv("USERPROFILE"));
+            linenoiseHistoryLoad(historyfile);
+        }
+#else
         if (getenv("HOME") != NULL) {
             historyfile = sdscatprintf(sdsempty(),"%s/.rediscli_history",getenv("HOME"));
             linenoiseHistoryLoad(historyfile);
         }
+#endif
     }
 
     cliRefreshPrompt();
@@ -793,6 +808,19 @@ int main(int argc, char **argv) {
     config.mb_delim = sdsnew("\n");
     cliInitHelp();
 
+#ifdef _WIN32
+    _fmode = _O_BINARY;
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+
+    if (!w32initWinSock()) {
+      printf("Winsock init error %d", WSAGetLastError());
+      exit(1);
+    };
+
+    atexit((void(*)(void)) WSACleanup);
+#endif
     firstarg = parseOptions(argc,argv);
     argc -= firstarg;
     argv += firstarg;

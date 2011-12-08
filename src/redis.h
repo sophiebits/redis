@@ -13,11 +13,21 @@
 #include <string.h>
 #include <time.h>
 #include <limits.h>
-#include <unistd.h>
 #include <errno.h>
+#ifndef _WIN32
+#include <unistd.h>
 #include <inttypes.h>
+#endif
 #include <pthread.h>
+#ifndef _WIN32
 #include <syslog.h>
+#endif
+#if defined _WIN32
+#include "win32fixes.h"
+#endif
+#ifdef LIBUV
+#include "../deps/libuv/include/uv.h"
+#endif
 
 #include "ae.h"     /* Event driven programming library */
 #include "sds.h"    /* Dynamic safe strings */
@@ -230,8 +240,21 @@
 #define REDIS_MAXMEMORY_ALLKEYS_RANDOM 4
 #define REDIS_MAXMEMORY_NO_EVICTION 5
 
+#ifdef _WIN32
+#define REDIS_FOPENREAD "rb"
+#define REDIS_FOPENWRITE "wb"
+#else
+#define REDIS_FOPENREAD "r"
+#define REDIS_FOPENWRITE "w"
+#endif
+
 /* We can print the stacktrace, so our assert is defined this way: */
+#ifdef _WIN32
+/* Windows fix: added two blanks. */
+#define redisAssert(_e) ((_e) ? (void)0 : (_redisAssert(#_e,__FILE__,__LINE__),_exit(1)))
+#else
 #define redisAssert(_e) ((_e)?(void)0 : (_redisAssert(#_e,__FILE__,__LINE__),_exit(1)))
+#endif
 #define redisPanic(_e) _redisPanic(#_e,__FILE__,__LINE__),_exit(1)
 void _redisAssert(char *estr, char *file, int line);
 void _redisPanic(char *msg, char *file, int line);
@@ -322,10 +345,40 @@ typedef struct blockingState {
                              * for BRPOPLPUSH. */
 } blockingState;
 
+#ifdef LIBUV
+#define MAX_CLIENT_WRITEBUFS    3
+#define WRITECLIENT_IDLE        1
+#define WRITECLIENT_RETRY       2
+#define WRITECLIENT_SENDING     3
+
+/* Structure to hold data used for sending to client via LIBUV.
+ * buffers, request, client ref, and extra data ref */
+typedef struct writeclientData {
+    void *cli;
+    uv_buf_t bufs[MAX_CLIENT_WRITEBUFS];
+    uv_write_t wr;
+    int bufsUsed;
+    int state;
+    unsigned int listIndex;
+} writeclientData;
+
+/* callback for rdbLoad or AppendOnlyFileLoad completion */
+typedef void (*loadDoneCb)(int rc, void* data);
+#endif
+
 /* With multiplexing we need to take per-clinet state.
  * Clients are taken in a liked list. */
 typedef struct redisClient {
+#ifdef LIBUV
+    uv_stream_t *stream;
+    int cbpending;
+    uv_prepare_t sendReply_handle;
+    writeclientData wrData;
+    char reqbuf[REDIS_IOBUF_LEN];
+    int reqbufinuse;
+#else
     int fd;
+#endif    
     redisDb *db;
     int dictid;
     sds querybuf;
@@ -382,8 +435,16 @@ struct redisServer {
     char *bindaddr;
     char *unixsocket;
     mode_t unixsocketperm;
+#ifdef LIBUV
+    uv_handle_t **uv_open_handles;
+    int uv_open_handles_size;
+    int uv_open_handles_count;
+    uv_tcp_t uv_tcp_srv;
+    uv_pipe_t uv_domain;
+#else
     int ipfd;
     int sofd;
+#endif
     redisDb *db;
     long long dirty;            /* changes to DB from the last save */
     long long dirty_before_bgsave; /* used to restore dirty on failed BGSAVE */
@@ -398,7 +459,13 @@ struct redisServer {
     struct redisCommand *delCommand, *multiCommand;
     list *slaves, *monitors;
     char neterr[ANET_ERR_LEN];
+#ifdef LIBUV
+    uv_loop_t* uvloop;
+    uv_timer_t uv_cron_timer;
+    uv_prepare_t uv_prepare_sleep;
+#else
     aeEventLoop *el;
+#endif
     int cronloops;              /* number of times the cron function run */
     time_t lastsave;                /* Unix time of last save succeeede */
     /* Fields used only for stats */
@@ -461,7 +528,11 @@ struct redisServer {
     int repl_syncio_timeout; /* timeout for synchronous I/O calls */
     int replstate;          /* replication status if the instance is a slave */
     off_t repl_transfer_left;  /* bytes left reading .rdb  */
+#ifdef LIBUV
+    uv_tcp_t *uv_tcp_repl_transfer_s;
+#else
     int repl_transfer_s;    /* slave -> master SYNC socket */
+#endif
     int repl_transfer_fd;   /* slave -> master SYNC temp file descriptor */
     char *repl_transfer_tmpfile; /* slave-> master SYNC temp file name */
     time_t repl_transfer_lastio; /* unix time of the latest read, for timeout */
@@ -519,8 +590,13 @@ struct redisServer {
      * to be read or written, so when a threaded I/O operation is ready to be
      * processed by the main thread, the I/O thread will use a unix pipe to
      * awake the main thread. The followings are the two pipe FDs. */
+#ifdef LIBUV
+    /* use Libuv async handle to synchronize */
+    uv_async_t io_ready_async_handle;
+#else
     int io_ready_pipe_read;
     int io_ready_pipe_write;
+#endif
     /* Virtual memory stats */
     unsigned long long vm_stats_used_pages;
     unsigned long long vm_stats_swapped_objects;
@@ -558,7 +634,11 @@ struct redisCommand {
 
 struct redisFunctionSym {
     char *name;
+#ifdef _WIN32
+    size_t pointer;
+#else    
     unsigned long pointer;
+#endif
 };
 
 typedef struct _redisSortObject {
@@ -672,19 +752,30 @@ dictType hashDictType;
  *----------------------------------------------------------------------------*/
 
 /* networking.c -- Networking and Client related operations */
+#ifdef LIBUV
+redisClient *createClient(uv_stream_t* stream);
+void sendReplyToClient(uv_prepare_t* handle, int status);
+#else
 redisClient *createClient(int fd);
+void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask);
+#endif
 void closeTimedoutClients(void);
 void freeClient(redisClient *c);
 void resetClient(redisClient *c);
-void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask);
 void addReply(redisClient *c, robj *obj);
 void *addDeferredMultiBulkLength(redisClient *c);
 void setDeferredMultiBulkLength(redisClient *c, void *node, long length);
 void addReplySds(redisClient *c, sds s);
 void processInputBuffer(redisClient *c);
+#ifdef LIBUV
+void acceptTcpHandler(uv_stream_t* tcpsrv, int status);
+void acceptUnixHandler(uv_stream_t* pipesrv, int status);
+void readQueryFromClient(uv_stream_t* stream, ssize_t nread, uv_buf_t buf);
+#else
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask);
+#endif
 void addReplyBulk(redisClient *c, robj *obj);
 void addReplyBulkCString(redisClient *c, char *s);
 void addReplyBulkCBuffer(redisClient *c, void *p, size_t len);
@@ -702,6 +793,10 @@ void getClientsMaxBuffers(unsigned long *longest_output_list,
                           unsigned long *biggest_input_buffer);
 void rewriteClientCommandVector(redisClient *c, int argc, ...);
 
+#ifdef _WIN32
+void addReplyErrorFormat(redisClient *c, const char *fmt, ...);
+void addReplyStatusFormat(redisClient *c, const char *fmt, ...);
+#else
 #ifdef __GNUC__
 void addReplyErrorFormat(redisClient *c, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
@@ -710,6 +805,7 @@ void addReplyStatusFormat(redisClient *c, const char *fmt, ...)
 #else
 void addReplyErrorFormat(redisClient *c, const char *fmt, ...);
 void addReplyStatusFormat(redisClient *c, const char *fmt, ...);
+#endif
 #endif
 
 /* List data type */
@@ -791,7 +887,11 @@ void loadingProgress(off_t pos);
 void stopLoading(void);
 
 /* RDB persistence */
+#ifdef LIBUV
+int rdbLoadStart(char *filename, loadDoneCb cb, void *cdata);
+#else
 int rdbLoad(char *filename);
+#endif
 int rdbSaveBackground(char *filename);
 void rdbRemoveTempFile(pid_t childpid);
 int rdbSave(char *filename);
@@ -807,7 +907,11 @@ void flushAppendOnlyFile(int force);
 void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int argc);
 void aofRemoveTempFile(pid_t childpid);
 int rewriteAppendOnlyFileBackground(void);
+#ifdef LIBUV
+int loadAppendOnlyFileStart(char *filename, loadDoneCb cb, void *cdata);
+#else
 int loadAppendOnlyFile(char *filename);
+#endif
 void stopAppendOnly(void);
 int startAppendOnly(void);
 void backgroundRewriteDoneHandler(int statloc);

@@ -55,7 +55,7 @@ set ::force_failure 0
 # The server is responsible of showing the result to the user, and exit with
 # the appropriate exit code depending on the test outcome.
 set ::client 0
-set ::numclients 16
+set ::numclients 4
 
 proc execute_tests name {
     set path "tests/$name.tcl"

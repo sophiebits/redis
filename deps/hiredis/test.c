@@ -10,6 +10,11 @@
 
 #include "hiredis.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#endif
+
 /* The following lines make up our testing "framework" :) */
 static int tests = 0, fails = 0;
 #define test(_s) { printf("#%02d ", ++tests); printf(_s); }
@@ -515,7 +520,22 @@ int main(int argc, char **argv) {
             use_unix = 1;
     }
 
+#ifdef _WIN32
+    WSADATA t_wsa;
+    WORD wVers;
+    int iError;
+
+    wVers = MAKEWORD(2, 2); // Set the version number to 2.2
+    iError = WSAStartup(wVers, &t_wsa);
+    if(iError != NO_ERROR || LOBYTE(t_wsa.wVersion) != 2 || HIBYTE(t_wsa.wVersion) != 2 ) {
+       printf("Winsock2 init error: %d\n", iError);
+       exit(1);
+    }
+
+    atexit((void(*)(void)) WSACleanup);
+#else
     signal(SIGPIPE, SIG_IGN);
+#endif
     test_format_commands();
     test_blocking_connection();
     test_reply_reader();

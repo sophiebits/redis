@@ -1,7 +1,9 @@
 #include "redis.h"
 #include "sha1.h"   /* SHA1 is used for DEBUG DIGEST */
 
+#ifndef _WIN32
 #include <arpa/inet.h>
+#endif
 
 /* ================================= Debugging ============================== */
 
@@ -214,6 +216,29 @@ void computeDatasetDigest(unsigned char *final) {
     }
 }
 
+#ifdef LIBUV
+/* AofLoad is async with callback */
+void debugAofLoadComplete(int status, void *cdata) {
+    redisClient *c = cdata;
+    if (status != REDIS_OK)
+        addReply(c,shared.err);
+    else {
+        redisLog(REDIS_WARNING,"Append Only File loaded by DEBUG LOADAOF");
+        addReply(c,shared.ok);
+    }
+}
+/* RdbLoad is async with callback */
+void debugRdbLoadComplete(int status, void *cdata) {
+    redisClient *c = cdata;
+    if (status != REDIS_OK)
+        addReply(c,shared.err);
+    else {
+        redisLog(REDIS_WARNING,"DB reloaded by DEBUG RELOAD");
+        addReply(c,shared.ok);
+    }
+}
+#endif
+
 void debugCommand(redisClient *c) {
     if (!strcasecmp(c->argv[1]->ptr,"segfault")) {
         *((char*)-1) = 'x';
@@ -223,20 +248,34 @@ void debugCommand(redisClient *c) {
             return;
         }
         emptyDb();
+#ifdef LIBUV
+        if (rdbLoadStart(server.dbfilename, debugRdbLoadComplete, c) != REDIS_OK) {
+            addReply(c,shared.err);
+        }
+        return;
+#else
         if (rdbLoad(server.dbfilename) != REDIS_OK) {
             addReplyError(c,"Error trying to load the RDB dump");
             return;
         }
         redisLog(REDIS_WARNING,"DB reloaded by DEBUG RELOAD");
         addReply(c,shared.ok);
+#endif
     } else if (!strcasecmp(c->argv[1]->ptr,"loadaof")) {
         emptyDb();
+#ifdef LIBUV
+        if (loadAppendOnlyFileStart(server.appendfilename, debugAofLoadComplete, c) != REDIS_OK) {
+            addReply(c,shared.err);
+        }
+        return;
+#else
         if (loadAppendOnlyFile(server.appendfilename) != REDIS_OK) {
             addReply(c,shared.err);
             return;
         }
         redisLog(REDIS_WARNING,"Append Only File loaded by DEBUG LOADAOF");
         addReply(c,shared.ok);
+#endif
     } else if (!strcasecmp(c->argv[1]->ptr,"object") && c->argc == 3) {
         dictEntry *de = dictFind(c->db->dict,c->argv[2]->ptr);
         robj *val;

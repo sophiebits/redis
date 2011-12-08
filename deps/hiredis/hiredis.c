@@ -31,7 +31,9 @@
 
 #include <string.h>
 #include <stdlib.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <assert.h>
 #include <errno.h>
 #include <ctype.h>
@@ -40,6 +42,15 @@
 #include "net.h"
 #include "sds.h"
 #include "util.h"
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#endif
+
+#ifdef _WIN32
+#define va_copy(d,s) d = (s)
+#endif
 
 typedef struct redisReader {
     struct redisReplyObjectFunctions *fn;
@@ -596,7 +607,7 @@ static int intlen(int i) {
 /* Helper function for redisvFormatCommand(). */
 static void addArgument(sds a, char ***argv, int *argc, int *totlen) {
     (*argc)++;
-    if ((*argv = realloc(*argv, sizeof(char*)*(*argc))) == NULL) redisOOM();
+    if ((*argv = (char **)realloc(*argv, sizeof(char*)*(*argc))) == NULL) redisOOM();
     if (totlen) *totlen = *totlen+1+intlen(sdslen(a))+2+sdslen(a)+2;
     (*argv)[(*argc)-1] = a;
 }
@@ -697,7 +708,11 @@ int redisvFormatCommand(char **target, const char *format, va_list ap) {
                     }
 
                     /* Consume and discard vararg */
+#ifdef _WIN32
+                    va_arg(ap,void*);
+#else
                     va_arg(ap,void);
+#endif
                 }
             }
             touched = 1;
@@ -717,11 +732,15 @@ int redisvFormatCommand(char **target, const char *format, va_list ap) {
     totlen += 1+intlen(argc)+2;
 
     /* Build the command at protocol level */
-    cmd = malloc(totlen+1);
+    cmd = (char*)malloc(totlen+1);
     if (!cmd) redisOOM();
     pos = sprintf(cmd,"*%d\r\n",argc);
     for (j = 0; j < argc; j++) {
+#ifdef _WIN32
+        pos += sprintf(cmd+pos,"$%llu\r\n",(unsigned long long)sdslen(argv[j]));
+#else
         pos += sprintf(cmd+pos,"$%zu\r\n",sdslen(argv[j]));
+#endif
         memcpy(cmd+pos,argv[j],sdslen(argv[j]));
         pos += sdslen(argv[j]);
         sdsfree(argv[j]);
@@ -780,7 +799,11 @@ int redisFormatCommandArgv(char **target, int argc, const char **argv, const siz
     pos = sprintf(cmd,"*%d\r\n",argc);
     for (j = 0; j < argc; j++) {
         len = argvlen ? argvlen[j] : strlen(argv[j]);
+#ifdef _WIN32
+        pos += sprintf(cmd+pos,"$%llu\r\n",(unsigned long long)len);
+#else
         pos += sprintf(cmd+pos,"$%zu\r\n",len);
+#endif
         memcpy(cmd+pos,argv[j],len);
         pos += len;
         cmd[pos++] = '\r';
@@ -815,7 +838,11 @@ static redisContext *redisContextInit(void) {
 
 void redisFree(redisContext *c) {
     if (c->fd > 0)
+#ifdef _WIN32
+        closesocket(c->fd);
+#else
         close(c->fd);
+#endif
     if (c->errstr != NULL)
         sdsfree(c->errstr);
     if (c->obuf != NULL)
@@ -870,6 +897,21 @@ redisContext *redisConnectUnixNonBlock(const char *path) {
     return c;
 }
 
+/* initializers if caller handles connection */
+redisContext *redisConnected() {
+    redisContext *c = redisContextInit();
+    c->fd = -1;
+    c->flags |= REDIS_BLOCK;
+    return c;
+}
+
+redisContext *redisConnectedNonBlock() {
+    redisContext *c = redisContextInit();
+    c->fd = -1;
+    c->flags &= ~REDIS_BLOCK;
+    return c;
+}
+
 /* Set read/write timeout on a blocking socket. */
 int redisSetTimeout(redisContext *c, struct timeval tv) {
     if (c->flags & REDIS_BLOCK)
@@ -902,7 +944,16 @@ static void __redisCreateReplyReader(redisContext *c) {
  * see if there is a reply available. */
 int redisBufferRead(redisContext *c) {
     char buf[2048];
+#ifdef _WIN32
+    int nread = recv((SOCKET)c->fd,buf,sizeof(buf),0);
+    if (nread == -1) {
+        errno = WSAGetLastError();
+        if ((errno == ENOENT) || (errno == WSAEWOULDBLOCK))
+            errno = EAGAIN;
+    }
+#else
     int nread = read(c->fd,buf,sizeof(buf));
+#endif
     if (nread == -1) {
         if (errno == EAGAIN && !(c->flags & REDIS_BLOCK)) {
             /* Try again later */
@@ -911,6 +962,23 @@ int redisBufferRead(redisContext *c) {
             return REDIS_ERR;
         }
     } else if (nread == 0) {
+        __redisSetError(c,REDIS_ERR_EOF,
+            sdsnew("Server closed the connection"));
+        return REDIS_ERR;
+    } else {
+        __redisCreateReplyReader(c);
+        redisReplyReaderFeed(c->reader,buf,nread);
+    }
+    return REDIS_OK;
+}
+
+/* Use this function if the caller has already read the data. It will
+ * feed bytes to the reply parser.
+ *
+ * After this function is called, you may use redisContextReadReply to
+ * see if there is a reply available. */
+int redisBufferReadDone(redisContext *c, char *buf, int nread) {
+    if (nread == 0) {
         __redisSetError(c,REDIS_ERR_EOF,
             sdsnew("Server closed the connection"));
         return REDIS_ERR;
@@ -933,7 +1001,16 @@ int redisBufferRead(redisContext *c) {
 int redisBufferWrite(redisContext *c, int *done) {
     int nwritten;
     if (sdslen(c->obuf) > 0) {
+#ifdef _WIN32
+        nwritten = send((SOCKET)c->fd,c->obuf,sdslen(c->obuf),0);
+        if (nwritten == -1) {
+            errno = WSAGetLastError();
+            if ((errno == ENOENT) || (errno == WSAEWOULDBLOCK))
+                errno = EAGAIN;
+        }
+#else
         nwritten = write(c->fd,c->obuf,sdslen(c->obuf));
+#endif
         if (nwritten == -1) {
             if (errno == EAGAIN && !(c->flags & REDIS_BLOCK)) {
                 /* Try again later */
